@@ -1,0 +1,6 @@
+{
+  "name": "Atelier Conception Jeu — Portail Orchestrateur",
+  "description": "Portail maître d'orchestration, de déploiement Git/systemd et de routage Caddy pour la VM Oracle atelierconceptionjeu.fr (Forêt Automate Lab, LoRA Factory v2, BGA Studio).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
