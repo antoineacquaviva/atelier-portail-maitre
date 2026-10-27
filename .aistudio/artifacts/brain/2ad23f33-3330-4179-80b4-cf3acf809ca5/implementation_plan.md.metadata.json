@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan d'architecture et d'implémentation pour la refonte de la VM Oracle (atelierconceptionjeu.fr), le script indépendant de nettoyage de Projet_Jeu (Étape 1), le workflow unifié Gemini / Windows 11 / GitHub / VM, l'intégration de lora-factory v2 et le Portail Orchestrateur actif.",
-  "updatedAt":  "2026-10-26T14:04:06.633917198Z",
+  "summary":  "Plan de refonte et de simplification du Portail Orchestrateur centré sur 3 besoins : accès 1-clic aux outils métier, déploiement de nouvelles versions (Git Pull AI Studio ou Upload direct d'archive ZIP Gemini avec push GitHub automatique par la VM, zéro dépôt requis sur PC Windows/Ubuntu), ajout automatisé d'un nouvel outil (Git + systemd + Caddyfile), bouton discret d'auto-mise à jour du portail, et documentation opérationnelle de bout en bout.",
+  "updatedAt":  "2026-10-27T08:02:21.692566345Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
