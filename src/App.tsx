@@ -73,7 +73,7 @@ export default function App() {
 
   const handleToolAction = async (
     toolId: string,
-    action: 'start' | 'stop' | 'restart' | 'clear-logs' | 'delete'
+    action: 'start' | 'stop' | 'restart' | 'clear-logs' | 'delete' | 'diagnose'
   ) => {
     setBusyToolId(toolId);
     try {
@@ -95,6 +95,7 @@ export default function App() {
           stop: 'Service arrêté',
           restart: 'Service redémarré',
           'clear-logs': 'Logs nettoyés',
+          diagnose: 'Diagnostic & Réparation 502 terminés',
         };
         showToast(`${data.tool.name} : ${labels[action] || 'Action effectuée'}`);
       }

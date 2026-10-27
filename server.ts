@@ -124,12 +124,50 @@ function saveToolsRegistry(tools: ToolItem[]) {
 
 let toolsState: ToolItem[] = loadToolsRegistry();
 
+/**
+ * Helper to execute a command on the VM and format detailed stderr/stdout if it fails.
+ */
+function runCmdWithDetails(cmd: string, log?: (msg: string) => void): string {
+  try {
+    return execSync(cmd, {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 20 * 1024 * 1024,
+    });
+  } catch (err: any) {
+    const stdout = err.stdout ? String(err.stdout).trim() : '';
+    const stderr = err.stderr ? String(err.stderr).trim() : '';
+    const combined = [stdout, stderr].filter(Boolean).join('\n');
+    const tail = combined
+      .split('\n')
+      .slice(-20)
+      .join('\n');
+    if (log && tail) {
+      log(`Détail sortie commande :\n${tail}`);
+    }
+    throw new Error(tail || err.message || `Échec de la commande: ${cmd}`);
+  }
+}
+
+function isPortListening(port: number): boolean {
+  if (!isOracleVm) return true;
+  try {
+    const out = execSync(`ss -tln | grep -E ":${port}\\b" || true`, {
+      encoding: 'utf-8',
+    }).trim();
+    return out.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function refreshLiveVmStates() {
   if (!isOracleVm) return;
   for (const tool of toolsState) {
     try {
       execSync(`systemctl is-active --quiet ${tool.systemdUnit}`);
-      tool.status = 'active';
+      // Also check that the port is genuinely listening so we don't report 'active' when it's 502
+      tool.status = isPortListening(tool.port) ? 'active' : 'stopped';
     } catch {
       tool.status = fs.existsSync(`/etc/systemd/system/${tool.systemdUnit}`)
         ? 'stopped'
@@ -228,6 +266,7 @@ WorkingDirectory=${tool.vmPath}
 Environment=NODE_ENV=production
 Environment=PYTHONUNBUFFERED=1
 Environment=PORT=${tool.port}
+Environment= PATH=/home/opc/venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=${tool.execStart}
 Restart=always
 RestartSec=3
@@ -238,7 +277,6 @@ WantedBy=multi-user.target
 }
 
 function applySubpathPatchInDirectory(targetDir: string, subpath: string) {
-  // Never patch index.html if this is a Vite/Node project (Vite uses --base=/subpath/ instead)
   if (fs.existsSync(path.join(targetDir, 'package.json'))) {
     return;
   }
@@ -282,11 +320,65 @@ function applySubpathPatchInDirectory(targetDir: string, subpath: string) {
 }
 
 /**
- * Inspects the files inside tool.vmPath and automatically configures the right
- * build command and systemd ExecStart command (whether it's an AI Studio Vite/React app,
- * a Node/Express server.ts app, a Python Flask app, or a Python FastAPI app).
+ * Patches server.ts so it does not hardcode PORT = 3000 (which collides with the Portal on port 3000!)
+ * and ensures relative API fetches in src/ work behind Caddy handle_path.
  */
-function autoDetectAndBuildProject(
+function patchNodeServerAndClientForSubpath(
+  vmPath: string,
+  port: number,
+  log: (msg: string) => void
+) {
+  const serverTsPath = path.join(vmPath, 'server.ts');
+  if (fs.existsSync(serverTsPath)) {
+    let code = fs.readFileSync(serverTsPath, 'utf-8');
+    const updated = code
+      .replace(
+        /const\s+PORT\s*=\s*3000\s*;/g,
+        `const PORT = Number(process.env.PORT) || ${port};`
+      )
+      .replace(
+        /const\s+port\s*=\s*3000\s*;/g,
+        `const port = Number(process.env.PORT) || ${port};`
+      )
+      .replace(/\.listen\(\s*3000\b/g, `.listen(Number(process.env.PORT) || ${port}`);
+    if (updated !== code) {
+      fs.writeFileSync(serverTsPath, updated, 'utf-8');
+      log(`Port 3000 dans server.ts automatiquement adapté vers le port ${port}.`);
+    }
+  }
+
+  // Also convert absolute fetch('/api/...') to relative fetch('api/...') in src/ so calls go through /lab/api/...
+  const srcDir = path.join(vmPath, 'src');
+  if (fs.existsSync(srcDir)) {
+    const patchRecursive = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          patchRecursive(fullPath);
+        } else if (/\.(ts|tsx|js|jsx)$/.test(entry.name)) {
+          const orig = fs.readFileSync(fullPath, 'utf-8');
+          const next = orig
+            .replace(/fetch\(\s*['"]\/api\//g, (m) => m.replace('/api/', 'api/'))
+            .replace(/fetch\(\s*`\/api\//g, 'fetch(`api/');
+          if (next !== orig) {
+            fs.writeFileSync(fullPath, next, 'utf-8');
+          }
+        }
+      }
+    };
+    try {
+      patchRecursive(srcDir);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Inspects the files inside tool.vmPath, builds the project, configures systemd,
+ * starts the service, and verifies that the target port is actively listening.
+ */
+function autoDetectBuildAndStartService(
   tool: ToolItem,
   autoSubpathPatch: boolean,
   log: (msg: string) => void
@@ -294,12 +386,16 @@ function autoDetectAndBuildProject(
   const cleanSub = tool.subpath.replace(/\/+$/, '');
   const pkgJsonPath = path.join(tool.vmPath, 'package.json');
   const appPyPath = path.join(tool.vmPath, 'app.py');
+  const mainPyPath = path.join(tool.vmPath, 'main.py');
+  const pythonBin = fs.existsSync('/home/opc/venv/bin/python3')
+    ? '/home/opc/venv/bin/python3'
+    : '/usr/bin/python3';
 
   if (fs.existsSync(pkgJsonPath)) {
-    log(`Projet Node.js / Vite (Google AI Studio) détecté dans ${tool.vmPath}.`);
+    log(`Projet Node.js / Vite détecté dans ${tool.vmPath}.`);
     tool.stackPreset = 'node';
 
-    // Ensure source index.html doesn't have an injected <base> tag that breaks Vite build
+    // 1. Clean any injected <base href> in source index.html so Vite doesn't choke
     const srcIndexHtml = path.join(tool.vmPath, 'index.html');
     if (fs.existsSync(srcIndexHtml)) {
       const content = fs.readFileSync(srcIndexHtml, 'utf-8');
@@ -312,44 +408,154 @@ function autoDetectAndBuildProject(
       }
     }
 
-    const buildCmd = `npm install --legacy-peer-deps && npx vite build --base=${cleanSub}/`;
+    // 2. Patch server.ts (if present) so it doesn't collide with port 3000, and patch fetch('/api/...')
+    patchNodeServerAndClientForSubpath(tool.vmPath, tool.port, log);
+
+    // 3. Backup existing dist/ in case the new build has a syntax error
+    const distDir = path.join(tool.vmPath, 'dist');
+    const backupDist = `/tmp/dist_backup_${tool.id}`;
+    if (fs.existsSync(distDir)) {
+      try {
+        execSync(`rm -rf "${backupDist}" && cp -r "${distDir}" "${backupDist}"`);
+      } catch {
+        // ignore
+      }
+    }
+
+    const buildCmd = `npm install --legacy-peer-deps && ./node_modules/.bin/vite build --base=${cleanSub}/`;
     tool.buildCmd = buildCmd;
     log(`Installation npm et compilation Vite (--base=${cleanSub}/) en cours...`);
-    execSync(`cd "${tool.vmPath}" && ${buildCmd}`, { stdio: 'pipe' });
-    log(`Compilation Vite terminée avec succès (dossier dist/ généré).`);
+    try {
+      runCmdWithDetails(`cd "${tool.vmPath}" && ${buildCmd}`, log);
+      log(`Compilation Vite réussie (dossier dist/ prêt).`);
+    } catch (buildErr: any) {
+      log(`Alerte Build Vite : ${buildErr.message}`);
+      if (fs.existsSync(backupDist) && !fs.existsSync(path.join(distDir, 'index.html'))) {
+        execSync(`rm -rf "${distDir}" && cp -r "${backupDist}" "${distDir}"`);
+        log(`Ancien dossier dist/ restauré pour éviter une coupure de service.`);
+      } else {
+        throw buildErr;
+      }
+    }
 
-    // Check if the project has a custom backend server.ts or is a pure SPA
-    if (fs.existsSync(path.join(tool.vmPath, 'server.ts'))) {
-      tool.execStart = `/usr/bin/npx tsx server.ts`;
-      log(`Serveur Express server.ts détecté (Port ${tool.port}).`);
+    // 4. Determine ExecStart
+    const hasServerTs = fs.existsSync(path.join(tool.vmPath, 'server.ts'));
+    if (hasServerTs) {
+      const tsxBin = fs.existsSync(path.join(tool.vmPath, 'node_modules/.bin/tsx'))
+        ? path.join(tool.vmPath, 'node_modules/.bin/tsx')
+        : '/usr/bin/npx tsx';
+      tool.execStart = `${tsxBin} ${tool.vmPath}/server.ts`;
+      log(`Backend server.ts détecté -> démarrage sur le port ${tool.port}.`);
     } else {
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
-      log(
-        `Application SPA Vite détectée : servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`
-      );
+      log(`SPA statique Vite -> servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`);
     }
-  } else if (fs.existsSync(appPyPath)) {
-    log(`Projet Python (app.py) détecté dans ${tool.vmPath}.`);
+  } else if (fs.existsSync(appPyPath) || fs.existsSync(mainPyPath)) {
+    const pyEntry = fs.existsSync(appPyPath) ? 'app.py' : 'main.py';
+    const pyFull = path.join(tool.vmPath, pyEntry);
+    log(`Projet Python (${pyEntry}) détecté dans ${tool.vmPath}.`);
+
     if (autoSubpathPatch) {
       applySubpathPatchInDirectory(tool.vmPath, cleanSub);
       log(`Adaptation des chemins relatifs appliquée pour ${cleanSub}/.`);
     }
+
     const reqTxt = path.join(tool.vmPath, 'requirements.txt');
     if (fs.existsSync(reqTxt)) {
       log(`Installation des dépendances Python (requirements.txt)...`);
-      execSync(`python3 -m pip install -r "${reqTxt}" --user`, { stdio: 'pipe' });
+      runCmdWithDetails(`${pythonBin} -m pip install -r "${reqTxt}"`, log);
     }
-    const appPyContent = fs.readFileSync(appPyPath, 'utf-8');
-    if (appPyContent.includes('FastAPI')) {
+
+    const pyContent = fs.readFileSync(pyFull, 'utf-8');
+    if (pyContent.includes('FastAPI')) {
       tool.stackPreset = 'fastapi';
-      tool.execStart = `/usr/bin/python3 -m uvicorn app:app --host 127.0.0.1 --port ${tool.port} --root-path ${cleanSub}`;
+      const moduleName = pyEntry.replace(/\.py$/, '');
+      tool.execStart = `${pythonBin} -m uvicorn ${moduleName}:app --host 127.0.0.1 --port ${tool.port} --root-path ${cleanSub}`;
     } else {
       tool.stackPreset = 'flask';
-      tool.execStart = `/usr/bin/python3 ${tool.vmPath}/app.py`;
+      tool.execStart = `${pythonBin} ${pyFull}`;
     }
+  } else if (fs.existsSync(path.join(tool.vmPath, 'index.html'))) {
+    log(`Site statique HTML détecté dans ${tool.vmPath}.`);
+    if (autoSubpathPatch) {
+      applySubpathPatchInDirectory(tool.vmPath, cleanSub);
+    }
+    tool.stackPreset = 'static-python';
+    tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}`;
   } else if (tool.buildCmd && tool.buildCmd.trim()) {
     log(`Exécution de la commande de build : ${tool.buildCmd}`);
-    execSync(`cd "${tool.vmPath}" && ${tool.buildCmd}`, { stdio: 'pipe' });
+    runCmdWithDetails(`cd "${tool.vmPath}" && ${tool.buildCmd}`, log);
+  }
+
+  // 5. Write systemd unit, reload daemon, and restart service
+  const unitContent = generateSystemdUnitFile(tool);
+  fs.writeFileSync(`/tmp/${tool.systemdUnit}`, unitContent, 'utf-8');
+  runCmdWithDetails(
+    `sudo mv /tmp/${tool.systemdUnit} /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl enable ${tool.systemdUnit}`,
+    log
+  );
+
+  // Free the port if an orphan process (outside this systemd unit) is holding it
+  try {
+    execSync(`sudo systemctl stop ${tool.systemdUnit} || true`);
+  } catch {
+    // ignore
+  }
+
+  runCmdWithDetails(`sudo systemctl restart ${tool.systemdUnit}`, log);
+
+  // Wait briefly and verify that the service is actually listening on tool.port
+  execSync('sleep 2');
+  const listening = isPortListening(tool.port);
+
+  if (!listening) {
+    // Capture journalctl logs to explain why it didn't bind
+    try {
+      const crashLogs = execSync(
+        `sudo journalctl -u ${tool.systemdUnit} -n 15 --no-pager -o cat`,
+        { encoding: 'utf-8' }
+      ).trim();
+      if (crashLogs) {
+        log(`Journal systemd (${tool.systemdUnit}) :\n${crashLogs}`);
+      }
+    } catch {
+      // ignore
+    }
+
+    // Automatic self-healing fallback if dist/index.html exists
+    const distIndex = path.join(tool.vmPath, 'dist', 'index.html');
+    if (fs.existsSync(distIndex)) {
+      log(
+        `Auto-réparation : bascule automatique sur le serveur statique dist/ (port ${tool.port}) pour éviter l'erreur 502.`
+      );
+      tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
+      const fallbackUnit = generateSystemdUnitFile(tool);
+      fs.writeFileSync(`/tmp/${tool.systemdUnit}`, fallbackUnit, 'utf-8');
+      runCmdWithDetails(
+        `sudo mv /tmp/${tool.systemdUnit} /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl restart ${tool.systemdUnit}`,
+        log
+      );
+      execSync('sleep 1');
+    }
+  }
+
+  // Ensure Caddyfile is synchronized and reloaded
+  try {
+    const caddyContent = generateCaddyfile(toolsState);
+    fs.writeFileSync('/tmp/Caddyfile.sync', caddyContent, 'utf-8');
+    execSync(
+      `sudo mv /tmp/Caddyfile.sync /etc/caddy/Caddyfile && sudo systemctl reload caddy`
+    );
+  } catch {
+    // ignore
+  }
+
+  if (isPortListening(tool.port)) {
+    tool.status = 'active';
+    log(`Vérification OK : le port ${tool.port} répond bien à Caddy (${cleanSub}/ opérationnel).`);
+  } else {
+    tool.status = 'stopped';
+    log(`Attention : aucun processus n'écoute encore sur le port ${tool.port}.`);
   }
 }
 
@@ -392,7 +598,7 @@ async function startServer() {
     });
   });
 
-  // 2. POST /api/tools/:id/action (start, stop, restart, clear-logs, delete)
+  // 2. POST /api/tools/:id/action (start, stop, restart, clear-logs, delete, diagnose)
   app.post('/api/tools/:id/action', (req, res) => {
     const { id } = req.params;
     const { action } = req.body || {};
@@ -427,16 +633,70 @@ async function startServer() {
       return;
     }
 
+    if (action === 'diagnose') {
+      const log = (msg: string) => {
+        tool.logs.push(`[${nowTime()}] ${msg}`);
+      };
+      log(`=== Diagnostic & Réparation 502 lancé pour ${tool.name} (Port ${tool.port}) ===`);
+
+      if (isOracleVm) {
+        try {
+          if (!fs.existsSync(tool.vmPath)) {
+            log(`Dossier ${tool.vmPath} absent -> clonage depuis GitHub (${tool.repo})...`);
+            fs.mkdirSync(path.dirname(tool.vmPath), { recursive: true });
+            runCmdWithDetails(
+              `git clone https://github.com/${tool.repo}.git "${tool.vmPath}"`,
+              log
+            );
+          } else {
+            const files = fs.readdirSync(tool.vmPath).join(', ');
+            log(`Fichiers présents dans ${tool.vmPath} : ${files}`);
+          }
+
+          try {
+            const jOut = execSync(
+              `sudo journalctl -u ${tool.systemdUnit} -n 20 --no-pager -o cat`,
+              { encoding: 'utf-8' }
+            ).trim();
+            if (jOut) {
+              log(`Derniers logs systemd (${tool.systemdUnit}) :\n${jOut}`);
+            }
+          } catch {
+            // ignore
+          }
+
+          autoDetectBuildAndStartService(tool, true, log);
+        } catch (err: any) {
+          log(`ERREUR Diagnostic/Réparation : ${err.message}`);
+        }
+      } else {
+        log(`[Simulation] Inspection de ${tool.vmPath}, vérification du port ${tool.port}, compilation Vite (--base=${tool.subpath}/) et redémarrage de ${tool.systemdUnit}.`);
+        tool.status = 'active';
+      }
+
+      saveToolsRegistry(toolsState);
+      res.json({ tool });
+      return;
+    }
+
     if (isOracleVm) {
       try {
         execSync(`sudo systemctl ${action} ${tool.systemdUnit}`);
-        tool.status = action === 'stop' ? 'stopped' : 'active';
+        execSync('sleep 1');
+        tool.status =
+          action === 'stop'
+            ? 'stopped'
+            : isPortListening(tool.port)
+            ? 'active'
+            : 'stopped';
         tool.logs.push(
-          `[${ts}] systemd: systemctl ${action} ${tool.systemdUnit} exécuté.`
+          `[${ts}] systemd: systemctl ${action} ${tool.systemdUnit} exécuté (Port ${tool.port}: ${
+            tool.status === 'active' ? 'ÉCOUTE OK' : 'NON ACTIF'
+          }).`
         );
         try {
           const jLogs = execSync(
-            `sudo journalctl -u ${tool.systemdUnit} -n 10 --no-pager -o short-iso`,
+            `sudo journalctl -u ${tool.systemdUnit} -n 12 --no-pager -o short-iso`,
             { encoding: 'utf-8' }
           )
             .trim()
@@ -484,39 +744,31 @@ async function startServer() {
         if (isOracleVm) {
           if (!fs.existsSync(path.join(tool.vmPath, '.git'))) {
             fs.mkdirSync(path.dirname(tool.vmPath), { recursive: true });
-            execSync(
-              `git clone https://github.com/${tool.repo}.git "${tool.vmPath}"`
+            runCmdWithDetails(
+              `git clone https://github.com/${tool.repo}.git "${tool.vmPath}"`,
+              log
             );
             log(`Dépôt cloné dans ${tool.vmPath}.`);
           } else {
-            execSync(
-              `git -C "${tool.vmPath}" fetch origin ${tool.branch} && git -C "${tool.vmPath}" reset --hard origin/${tool.branch}`
+            runCmdWithDetails(
+              `git -C "${tool.vmPath}" fetch origin ${tool.branch} && git -C "${tool.vmPath}" reset --hard origin/${tool.branch}`,
+              log
             );
             log(`Code aligné sur origin/${tool.branch}.`);
           }
 
-          autoDetectAndBuildProject(tool, Boolean(body.autoSubpathPatch), log);
+          autoDetectBuildAndStartService(tool, Boolean(body.autoSubpathPatch), log);
 
-          // Always write/update the systemd unit file so ExecStart matches the detected stack
-          const unitContent = generateSystemdUnitFile(tool);
-          fs.writeFileSync(`/tmp/${tool.systemdUnit}`, unitContent, 'utf-8');
-          execSync(
-            `sudo mv /tmp/${tool.systemdUnit} /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl enable ${tool.systemdUnit}`
-          );
-          log(`Unité systemd ${tool.systemdUnit} configurée (${tool.execStart}).`);
-
-          execSync(`sudo systemctl restart ${tool.systemdUnit}`);
           const rev = execSync(`git -C "${tool.vmPath}" rev-parse --short HEAD`, {
             encoding: 'utf-8',
           }).trim();
           tool.commitHash = rev || tool.commitHash;
-          tool.status = 'active';
           log(
-            `Service ${tool.systemdUnit} redémarré avec succès (commit ${tool.commitHash}).`
+            `Déploiement terminé (commit ${tool.commitHash}, statut : ${tool.status.toUpperCase()}).`
           );
         } else {
           log(`[Aperçu] git -C ${tool.vmPath} fetch origin ${tool.branch} && reset --hard`);
-          log(`[Aperçu] Auto-détection stack & compilation Vite/Python`);
+          log(`[Aperçu] Auto-détection stack, adaptation port ${tool.port} & compilation Vite/Python`);
           log(`[Aperçu] sudo systemctl restart ${tool.systemdUnit}`);
           tool.status = 'active';
         }
@@ -541,7 +793,7 @@ async function startServer() {
           fs.writeFileSync(tmpZip, Buffer.from(body.zipBase64, 'base64'));
           fs.mkdirSync(tmpExtract, { recursive: true });
 
-          execSync(`unzip -q -o "${tmpZip}" -d "${tmpExtract}"`);
+          runCmdWithDetails(`unzip -q -o "${tmpZip}" -d "${tmpExtract}"`, log);
           log(`Archive décompressée dans ${tmpExtract}.`);
 
           const entries = fs.readdirSync(tmpExtract);
@@ -554,23 +806,15 @@ async function startServer() {
           }
 
           fs.mkdirSync(tool.vmPath, { recursive: true });
-          execSync(
-            `rsync -a --exclude='.git' --exclude='venv' --exclude='node_modules' --exclude='dataset' --exclude='originals' --exclude='models' --exclude='.gemini_key' "${sourceRoot}/" "${tool.vmPath}/"`
+          runCmdWithDetails(
+            `rsync -a --delete --exclude='.git' --exclude='venv' --exclude='node_modules' --exclude='dist' --exclude='dataset' --exclude='originals' --exclude='models' --exclude='.gemini_key' "${sourceRoot}/" "${tool.vmPath}/"`,
+            log
           );
           log(
-            `Fichiers copiés dans ${tool.vmPath} (données et .git préservés).`
+            `Fichiers synchronisés dans ${tool.vmPath} (données et .git préservés).`
           );
 
-          autoDetectAndBuildProject(tool, Boolean(body.autoSubpathPatch), log);
-
-          const unitContent = generateSystemdUnitFile(tool);
-          fs.writeFileSync(`/tmp/${tool.systemdUnit}`, unitContent, 'utf-8');
-          execSync(
-            `sudo mv /tmp/${tool.systemdUnit} /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl enable ${tool.systemdUnit}`
-          );
-          execSync(`sudo systemctl restart ${tool.systemdUnit}`);
-          tool.status = 'active';
-          log(`Service ${tool.systemdUnit} redémarré avec succès.`);
+          autoDetectBuildAndStartService(tool, Boolean(body.autoSubpathPatch), log);
 
           try {
             if (!fs.existsSync(path.join(tool.vmPath, '.git'))) {
@@ -601,7 +845,7 @@ async function startServer() {
             } else {
               log(`Aucun changement de code à commiter vers GitHub.`);
             }
-          } catch (gitErr: any) {
+          } catch {
             log(
               `Note Git Push : L'outil est bien déployé et actif sur la VM, mais le push vers GitHub nécessite d'autoriser la clé SSH de la VM (voir onglet Guide & Prérequis).`
             );
@@ -688,14 +932,17 @@ async function startServer() {
         fs.mkdirSync('/srv/jeu', { recursive: true });
         if (body.initialSource === 'git') {
           log(`Clonage de https://github.com/${newTool.repo}.git dans ${vmPath}...`);
-          execSync(`git clone https://github.com/${newTool.repo}.git "${vmPath}"`);
+          runCmdWithDetails(
+            `git clone https://github.com/${newTool.repo}.git "${vmPath}"`,
+            log
+          );
         } else if (body.initialSource === 'zip' && body.zipBase64) {
           log(`Extraction de l'archive initiale ${body.zipFileName || 'archive.zip'}...`);
           const tmpZip = `/tmp/new_${cleanId}_${Date.now()}.zip`;
           const tmpExtract = `/tmp/new_extract_${cleanId}_${Date.now()}`;
           fs.writeFileSync(tmpZip, Buffer.from(body.zipBase64, 'base64'));
           fs.mkdirSync(tmpExtract, { recursive: true });
-          execSync(`unzip -q -o "${tmpZip}" -d "${tmpExtract}"`);
+          runCmdWithDetails(`unzip -q -o "${tmpZip}" -d "${tmpExtract}"`, log);
 
           const entries = fs.readdirSync(tmpExtract);
           let sourceRoot = tmpExtract;
@@ -725,24 +972,9 @@ async function startServer() {
           fs.mkdirSync(vmPath, { recursive: true });
         }
 
-        autoDetectAndBuildProject(newTool, Boolean(body.autoSubpathPatch), log);
-
-        const unitContent = generateSystemdUnitFile(newTool);
-        fs.writeFileSync(`/tmp/${systemdUnit}`, unitContent, 'utf-8');
-        execSync(
-          `sudo mv /tmp/${systemdUnit} /etc/systemd/system/${systemdUnit} && sudo systemctl daemon-reload && sudo systemctl enable --now ${systemdUnit}`
-        );
-        log(`Service systemd ${systemdUnit} créé et démarré.`);
-
         toolsState.push(newTool);
+        autoDetectBuildAndStartService(newTool, Boolean(body.autoSubpathPatch), log);
         saveToolsRegistry(toolsState);
-
-        const caddyContent = generateCaddyfile(toolsState);
-        fs.writeFileSync('/tmp/Caddyfile.new', caddyContent, 'utf-8');
-        execSync(
-          `sudo mv /tmp/Caddyfile.new /etc/caddy/Caddyfile && sudo systemctl reload caddy`
-        );
-        log(`Caddyfile mis à jour et rechargé : route ${cleanSubpath}/ active !`);
       } else {
         log(`[Aperçu] Dossier ${vmPath} préparé.`);
         log(`[Aperçu] Service /etc/systemd/system/${systemdUnit} activé sur le port ${newTool.port}.`);

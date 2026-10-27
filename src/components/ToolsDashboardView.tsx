@@ -9,6 +9,7 @@ import {
   Plus,
   Trash2,
   BookOpen,
+  Wrench,
 } from 'lucide-react';
 import type { ToolItem, PortalSelfInfo } from '../types';
 
@@ -20,7 +21,7 @@ interface ToolsDashboardViewProps {
   onOpenNewToolModal: () => void;
   onToolAction: (
     toolId: string,
-    action: 'start' | 'stop' | 'restart' | 'clear-logs' | 'delete'
+    action: 'start' | 'stop' | 'restart' | 'clear-logs' | 'delete' | 'diagnose'
   ) => void;
   onNavigateGuide: () => void;
 }
@@ -111,7 +112,7 @@ export const ToolsDashboardView: React.FC<ToolsDashboardViewProps> = ({
                         ? 'EN LIGNE'
                         : tool.status === 'standby'
                         ? 'PRÉCONFIGURÉ'
-                        : 'ARRÊTÉ'}
+                        : 'ARRÊTÉ (502)'}
                     </span>
                     <span aria-hidden="true">·</span>
                     <span className="text-slate-200 font-semibold">
@@ -163,11 +164,25 @@ export const ToolsDashboardView: React.FC<ToolsDashboardViewProps> = ({
 
               {/* Quiet Secondary Bar: Repo Info + Service Controls */}
               <div className="pt-4 border-t border-slate-800/90 flex flex-wrap items-center justify-between gap-3 text-xs">
-                <div className="font-mono text-slate-400 truncate max-w-[260px]" title={tool.repo}>
+                <div className="font-mono text-slate-400 truncate max-w-[220px]" title={tool.repo}>
                   {tool.repo} · {tool.lastUpdated}
                 </div>
 
                 <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() => {
+                      setSelectedLogToolId(tool.id);
+                      onToolAction(tool.id, 'diagnose');
+                    }}
+                    title="Diagnostiquer l'erreur 502, corriger automatiquement le port / build Vite et relancer le service"
+                    className="px-2.5 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <Wrench className={`w-3.5 h-3.5 text-amber-400 ${isBusy ? 'animate-spin' : ''}`} />
+                    <span>Réparer 502</span>
+                  </button>
+
                   <button
                     type="button"
                     disabled={isBusy}
@@ -255,11 +270,20 @@ export const ToolsDashboardView: React.FC<ToolsDashboardViewProps> = ({
                 <span>Journaux d’exécution — {activeLogTool.name}</span>
               </div>
               <div className="text-xs font-mono text-slate-400">
-                Unité : {activeLogTool.systemdUnit} · Dossier VM : {activeLogTool.vmPath}
+                Unité : {activeLogTool.systemdUnit} · Dossier VM : {activeLogTool.vmPath} · Commande : {activeLogTool.execStart}
               </div>
             </div>
 
             <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={busyToolId === activeLogTool.id}
+                onClick={() => onToolAction(activeLogTool.id, 'diagnose')}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <Wrench className="w-3.5 h-3.5" />
+                Diagnostiquer & Réparer 502
+              </button>
               <button
                 type="button"
                 onClick={() => onToolAction(activeLogTool.id, 'clear-logs')}
@@ -278,7 +302,7 @@ export const ToolsDashboardView: React.FC<ToolsDashboardViewProps> = ({
             </div>
           </div>
 
-          <pre className="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs font-mono text-slate-300 overflow-x-auto max-h-64 leading-relaxed tabular-nums">
+          <pre className="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs font-mono text-slate-300 overflow-x-auto max-h-80 leading-relaxed tabular-nums whitespace-pre-wrap">
             {activeLogTool.logs.join('\n')}
           </pre>
         </div>
