@@ -291,32 +291,34 @@ function getVmPrerequisites(): VmPrerequisites {
 }
 
 function generateCaddyfile(tools: ToolItem[]): string {
+  const seenSubpaths = new Set<string>();
   const blocks = tools
+    .filter((t) => {
+      const cleanSub = t.subpath.startsWith('/')
+        ? t.subpath.replace(/\/+$/, '')
+        : `/${t.subpath.replace(/\/+$/, '')}`;
+      if (!cleanSub || seenSubpaths.has(cleanSub)) return false;
+      seenSubpaths.add(cleanSub);
+      return true;
+    })
     .map((t) => {
-      const cleanSub = t.subpath.startsWith('/') ? t.subpath : `/${t.subpath}`;
+      const cleanSub = t.subpath.startsWith('/')
+        ? t.subpath.replace(/\/+$/, '')
+        : `/${t.subpath.replace(/\/+$/, '')}`;
       return `    # Outil : ${t.name} (${cleanSub} -> 127.0.0.1:${t.port})
     redir ${cleanSub} ${cleanSub}/
     handle_path ${cleanSub}/* {
-        reverse_proxy 127.0.0.1:${t.port} {
-            header_up X-Forwarded-Prefix ${cleanSub}
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-        }
+        reverse_proxy 127.0.0.1:${t.port}
     }`;
     })
     .join('\n\n');
 
   return `atelierconceptionjeu.fr, www.atelierconceptionjeu.fr {
-    encode zstd gzip
-
 ${blocks}
 
     # Portail Maître Orchestrateur (Racine / -> 127.0.0.1:3000)
     handle {
-        reverse_proxy 127.0.0.1:3000 {
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-        }
+        reverse_proxy 127.0.0.1:3000
     }
 }
 `;
@@ -328,7 +330,7 @@ function syncCaddyConfig(log?: (msg: string) => void) {
     const caddyContent = generateCaddyfile(toolsState);
     fs.writeFileSync('/tmp/Caddyfile.sync', caddyContent, 'utf-8');
     execSync(
-      `sudo cp /tmp/Caddyfile.sync /etc/caddy/Caddyfile && (sudo systemctl reload caddy || sudo systemctl restart caddy)`
+      `sudo tee /etc/caddy/Caddyfile < /tmp/Caddyfile.sync > /dev/null && sudo chown root:root /etc/caddy/Caddyfile && sudo chmod 644 /etc/caddy/Caddyfile && (sudo restorecon -F /etc/caddy/Caddyfile || true) && (sudo systemctl reload caddy || sudo systemctl restart caddy)`
     );
     if (log) {
       log(`Configuration Caddy (/etc/caddy/Caddyfile) synchronisée et rechargée.`);
@@ -523,16 +525,23 @@ function autoDetectBuildAndStartService(
       }
     }
 
-    const hasServerTs = fs.existsSync(path.join(tool.vmPath, 'server.ts'));
+    const serverTsFile = path.join(tool.vmPath, 'server.ts');
+    const hasServerTs = fs.existsSync(serverTsFile);
+    let useNodeBackend = false;
     if (hasServerTs) {
+      const sContent = fs.readFileSync(serverTsFile, 'utf-8');
+      useNodeBackend = /['"`]\/?api\//.test(sContent);
+    }
+
+    if (useNodeBackend) {
       const tsxBin = fs.existsSync(path.join(tool.vmPath, 'node_modules/.bin/tsx'))
         ? path.join(tool.vmPath, 'node_modules/.bin/tsx')
         : '/usr/bin/npx tsx';
       tool.execStart = `${tsxBin} ${tool.vmPath}/server.ts`;
-      log(`Backend server.ts détecté -> démarrage sur le port ${tool.port}.`);
+      log(`Backend API server.ts détecté -> démarrage sur le port ${tool.port}.`);
     } else {
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
-      log(`SPA statique Vite -> servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`);
+      log(`Application Vite SPA -> servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`);
     }
   } else if (fs.existsSync(appPyPath) || fs.existsSync(mainPyPath)) {
     const pyEntry = fs.existsSync(appPyPath) ? 'app.py' : 'main.py';
@@ -574,7 +583,7 @@ function autoDetectBuildAndStartService(
   const unitContent = generateSystemdUnitFile(tool);
   fs.writeFileSync(`/tmp/${tool.systemdUnit}`, unitContent, 'utf-8');
   runCmdWithDetails(
-    `sudo mv /tmp/${tool.systemdUnit} /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl enable ${tool.systemdUnit}`,
+    `sudo tee /etc/systemd/system/${tool.systemdUnit} < /tmp/${tool.systemdUnit} > /dev/null && sudo chown root:root /etc/systemd/system/${tool.systemdUnit} && sudo chmod 644 /etc/systemd/system/${tool.systemdUnit} && (sudo restorecon -F /etc/systemd/system/${tool.systemdUnit} || true) && sudo systemctl daemon-reload && sudo systemctl enable ${tool.systemdUnit}`,
     log
   );
 
@@ -605,13 +614,13 @@ function autoDetectBuildAndStartService(
     const distIndex = path.join(tool.vmPath, 'dist', 'index.html');
     if (fs.existsSync(distIndex)) {
       log(
-        `Auto-réparation : bascule automatique sur le serveur statique dist/ (port ${tool.port}) pour éviter l'erreur 502.`
+        `Auto-réparation : bascule automatique sur le serveur statique dist/ (port ${tool.port}) pour éviter toute erreur.`
       );
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
       const fallbackUnit = generateSystemdUnitFile(tool);
       fs.writeFileSync(`/tmp/${tool.systemdUnit}`, fallbackUnit, 'utf-8');
       runCmdWithDetails(
-        `sudo mv /tmp/${tool.systemdUnit} /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl restart ${tool.systemdUnit}`,
+        `sudo tee /etc/systemd/system/${tool.systemdUnit} < /tmp/${tool.systemdUnit} > /dev/null && sudo chown root:root /etc/systemd/system/${tool.systemdUnit} && sudo chmod 644 /etc/systemd/system/${tool.systemdUnit} && (sudo restorecon -F /etc/systemd/system/${tool.systemdUnit} || true) && sudo systemctl daemon-reload && sudo systemctl restart ${tool.systemdUnit}`,
         log
       );
       execSync('sleep 1');
