@@ -9,12 +9,76 @@ import {
   Terminal,
   ExternalLink,
   Sparkles,
+  Download,
+  FileText,
 } from 'lucide-react';
 import type { VmPrerequisites } from '../types';
 
 interface DocumentationViewProps {
   prereqs: VmPrerequisites;
 }
+
+export const AI_STUDIO_INTEGRATION_DOC = `# ANNEXE TECHNIQUE : CONTRAT D'INTÉGRATION AU PORTAIL « ATELIER CONCEPTION JEU »
+*(Document à joindre ou coller en complément du cahier des charges fonctionnel dans Google AI Studio)*
+
+## 1. Contexte d'exécution (Double Environnement)
+Cette application doit fonctionner de manière transparente dans **deux environnements** sans aucune modification manuelle du code entre les deux :
+1. **Aperçu Google AI Studio (Preview Sandbox)** : servie à la racine \`/\` sur le port \`3000\`.
+2. **Production sur VM Oracle (\`https://atelierconceptionjeu.fr/<sous-chemin>/\`)** :
+   - Déployée dans \`/srv/jeu/<nom-outil>/\` et compilée avec \`npx vite build --base=/<sous-chemin>/\`.
+   - Exécutée via un service \`systemd\` avec \`NODE_ENV=production\` et un port dédié fourni par la variable d'environnement \`PORT\` (ex: \`8080\`, \`8082\`, \`8084\`... car le port \`3000\` de la VM est déjà occupé par le Portail Maître).
+   - Placée derrière un reverse-proxy **Caddy** configuré avec \`handle_path /<sous-chemin>/*\` (Caddy retire le préfixe \`/<sous-chemin>\` avant de transmettre la requête HTTP à \`127.0.0.1:<PORT>\`).
+
+---
+
+## 2. Règles d'architecture obligatoires à respecter dans le code
+
+### A. Port d'écoute du serveur (\`server.ts\`) — INTERDICTION de figer le port 3000
+Si l'application utilise un backend Express (\`server.ts\`), le port **doit obligatoirement** lire \`process.env.PORT\` avec repli sur \`3000\` :
+\`\`\`ts
+const PORT = Number(process.env.PORT) || 3000;
+// ...
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(\`Serveur actif sur http://0.0.0.0:\${PORT}\`);
+});
+\`\`\`
+*Pourquoi : dans AI Studio, \`process.env.PORT\` n'est pas défini donc l'app écoute sur \`3000\`. Sur la VM Oracle, \`systemd\` injecte \`PORT=808X\` pour éviter tout conflit \`EADDRINUSE\` avec le Portail Maître qui occupe le port \`3000\`.*
+
+### B. Appels API Frontend (\`fetch\`) — Chemins relatifs OBLIGATOIRES (sans \`/\` initial)
+Tous les appels \`fetch()\` du frontend React vers le backend Express doivent utiliser un **chemin relatif sans slash initial** :
+- ✅ **CORRECT** : \`fetch('api/simulations')\` ou \`fetch(\`\${import.meta.env.BASE_URL}api/simulations\`)\`
+- ❌ **INTERDIT** : \`fetch('/api/simulations')\`
+
+*Pourquoi : dans le navigateur, sur \`https://atelierconceptionjeu.fr/mon-outil/\`, un appel \`fetch('/api/...')\` avec un slash initial interrogerait la racine \`https://atelierconceptionjeu.fr/api/...\` (c'est-à-dire le Portail Maître sur le port 3000 !) au lieu de \`https://atelierconceptionjeu.fr/mon-outil/api/...\`. Avec \`fetch('api/...')\`, le navigateur appelle \`/mon-outil/api/...\`, Caddy (\`handle_path\`) retire \`/mon-outil\` et votre \`server.ts\` reçoit proprement \`GET /api/...\`. Et dans l'aperçu AI Studio (à la racine \`/\`), \`fetch('api/...')\` appelle aussi \`/api/...\` !*
+
+### C. Routage Frontend & Fichiers Statiques
+1. **Navigation interne** : Privilégier une navigation par état React (\`useState\`) ou \`HashRouter\`. Si \`BrowserRouter\` est utilisé, toujours lui passer \`basename={import.meta.env.BASE_URL}\`.
+2. **\`index.html\` propre** : Ne **jamais** écrire de balise \`<base href="...">\` en dur dans \`index.html\` (Vite gère automatiquement la réécriture des chemins d'assets via \`--base=/<sous-chemin>/\` lors du build de production).
+3. **Distribution de \`dist/\` en production dans \`server.ts\`** :
+\`\`\`ts
+if (process.env.NODE_ENV !== 'production') {
+  const vite = await createViteServer({
+    server: { middlewareMode: true },
+    appType: 'spa',
+  });
+  app.use(vite.middlewares);
+} else {
+  const distPath = path.join(__dirname, 'dist');
+  app.use(express.static(distPath));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+}
+\`\`\`
+
+### D. Persistance des données et exécution Python sur la VM (Optionnel)
+- Si l'outil sauvegarde des fichiers (JSON, SQLite, CSV, résultats de campagnes), les écrire dans un sous-dossier local \`./data/\` ou \`./outputs/\` (créé via \`fs.mkdirSync(..., { recursive: true })\`) pour qu'ils soient préservés lors des mises à jour Git/ZIP.
+- Si l'outil lance des scripts scientifiques Python sur la VM Oracle (16 vCPUs), utiliser l'interpréteur \`/home/opc/venv/bin/python3\` s'il existe sur le système (\`fs.existsSync('/home/opc/venv/bin/python3') ? '/home/opc/venv/bin/python3' : 'python3'\`), qui contient déjà \`numpy\`, \`numba\`, \`scipy\`, etc.
+
+### E. Ergonomie d'intégration au Portail
+- Ajouter dans l'en-tête (header) de l'application un lien discret permettant de revenir en un clic au portail principal :
+  \`<a href="https://atelierconceptionjeu.fr" target="_top">← Portail Atelier</a>\`
+`;
 
 export const DocumentationView: React.FC<DocumentationViewProps> = ({
   prereqs,
@@ -27,7 +91,21 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  const geminiPromptSnippet = `Important pour le déploiement : cette application web sera servie derrière un reverse-proxy Caddy dans un sous-chemin (ex: https://atelierconceptionjeu.fr/mon-outil/). Utilise uniquement des chemins relatifs dans le HTML et le JavaScript (ex: fetch('api/...') et href="static/..." sans slash initial '/') afin que tous les appels API et fichiers statiques fonctionnent dans un sous-chemin.`;
+  const downloadMarkdownDoc = () => {
+    const blob = new Blob([AI_STUDIO_INTEGRATION_DOC], {
+      type: 'text/markdown;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'SPEC_INTEGRATION_PORTAIL_ATELIER.md';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const geminiPromptSnippet = `Important pour le déploiement : cette application web sera servie derrière un reverse-proxy Caddy dans un sous-chemin (ex: https://atelierconceptionjeu.fr/mon-outil/). Utilise uniquement des chemins relatifs sans slash initial pour les appels API (fetch('api/...')) et écoute sur process.env.PORT || 3000 dans server.ts.`;
 
   return (
     <div className="space-y-8">
@@ -37,11 +115,61 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
           Documentation opérationnelle · Zéro dépôt requis sur vos PC (Ubuntu & Windows 11)
         </div>
         <h1 className="text-2xl font-bold text-slate-100 tracking-tight">
-          Guide de Déploiement de Bout en Bout & Étapes Manuelles Résiduelles
+          Guide de Déploiement de Bout en Bout & Contrat d’Intégration AI Studio
         </h1>
         <p className="text-sm text-slate-400 max-w-4xl leading-relaxed">
-          Ce portail centralise tous vos déploiements directement sur la VM Oracle (<span className="font-mono text-slate-200">141.145.218.127</span>). Vous n’avez plus besoin de maintenir de dépôts Git locaux sur votre PC Windows 11 ni sur votre PC Ubuntu.
+          Ce portail centralise tous vos déploiements directement sur la VM Oracle (<span className="font-mono text-slate-200">141.145.218.127</span>). Vous trouverez ci-dessous le document de spécification technique à joindre à vos demandes Google AI Studio ainsi que les procédures de déploiement.
         </p>
+      </div>
+
+      {/* NEW: Featured AI Studio Integration Spec Document Card */}
+      <div className="bg-slate-900 border border-emerald-500/30 rounded-xl p-6 space-y-4">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400">
+              <FileText className="w-4 h-4" />
+              <span>Document d’intégration pour Google AI Studio / Gemini</span>
+            </div>
+            <h2 className="text-lg font-bold text-slate-100">
+              Annexe Technique à joindre lors de la création d’une nouvelle application
+            </h2>
+            <p className="text-xs text-slate-400">
+              Téléchargez ce fichier <span className="font-mono text-slate-200">SPEC_INTEGRATION_PORTAIL_ATELIER.md</span> (pour le glisser en pièce jointe dans Google AI Studio) ou copiez-le à la fin de votre prompt fonctionnel.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => copyText('full-spec', AI_STUDIO_INTEGRATION_DOC)}
+              className="px-3.5 py-2.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 transition-colors flex items-center gap-2 whitespace-nowrap"
+            >
+              {copiedId === 'full-spec' ? (
+                <Check className="w-4 h-4 text-emerald-400" />
+              ) : (
+                <Copy className="w-4 h-4 text-emerald-400" />
+              )}
+              <span>
+                {copiedId === 'full-spec'
+                  ? 'Document copié !'
+                  : 'Copier tout le document'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={downloadMarkdownDoc}
+              className="px-4 py-2.5 rounded-lg text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors flex items-center gap-2 whitespace-nowrap"
+            >
+              <Download className="w-4 h-4" />
+              <span>Télécharger (.md)</span>
+            </button>
+          </div>
+        </div>
+
+        <pre className="bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs font-mono text-slate-300 overflow-x-auto max-h-80 leading-relaxed whitespace-pre-wrap">
+          {AI_STUDIO_INTEGRATION_DOC}
+        </pre>
       </div>
 
       {/* 3 Core Workflows */}
@@ -244,16 +372,16 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
             </p>
           </div>
 
-          {/* Manual Step D: Gemini Prompt Tip for Subpaths */}
+          {/* Manual Step D: Short Gemini Prompt Tip for Subpaths */}
           <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400">
                 <Sparkles className="w-4 h-4" />
-                <span>D. Consigne à glisser à Gemini lors de la création d’une interface Web</span>
+                <span>D. Version courte (1 phrase) pour une discussion Gemini rapide</span>
               </div>
             </div>
             <p className="text-xs text-slate-400 leading-relaxed">
-              Même si ce portail patche automatiquement les fichiers HTML/JS courants, vous pouvez coller cette phrase dans vos discussions Gemini pour que le code généré soit nativement compatible avec un sous-chemin Caddy (<span className="font-mono">/lab/</span>, <span className="font-mono">/lora/</span>) :
+              Si vous faites une demande rapide dans une discussion Gemini classique sans joindre le fichier complet :
             </p>
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-3 text-xs text-slate-300 italic leading-relaxed">
               « {geminiPromptSnippet} »
@@ -269,7 +397,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                 ) : (
                   <Copy className="w-3.5 h-3.5" />
                 )}
-                {copiedId === 'prompt' ? 'Consigne copiée' : 'Copier la consigne pour Gemini'}
+                {copiedId === 'prompt' ? 'Consigne copiée' : 'Copier la version courte'}
               </button>
             </div>
           </div>

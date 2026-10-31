@@ -32,11 +32,11 @@ export const NewToolModal: React.FC<NewToolModalProps> = ({
   const [port, setPort] = useState<number>(suggestedPort);
   const [repo, setRepo] = useState('antoineacquaviva/');
   const [description, setDescription] = useState('');
-  const [stackPreset, setStackPreset] = useState<StackPreset>('fastapi');
-  const [execStart, setExecStart] = useState(
-    `/home/opc/venv/bin/uvicorn app:app --host 127.0.0.1 --port ${suggestedPort} --root-path /outil`
+  const [stackPreset, setStackPreset] = useState<StackPreset>('node');
+  const [execStart, setExecStart] = useState(`/usr/bin/npx tsx server.ts`);
+  const [buildCmd, setBuildCmd] = useState(
+    'npm install --legacy-peer-deps && npm run build'
   );
-  const [buildCmd, setBuildCmd] = useState('');
   const [initialSource, setInitialSource] = useState<'git' | 'zip'>('git');
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [autoSubpathPatch, setAutoSubpathPatch] = useState<boolean>(true);
