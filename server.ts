@@ -509,9 +509,9 @@ function autoDetectBuildAndStartService(
       }
     }
 
-    const buildCmd = `npm install --legacy-peer-deps && ./node_modules/.bin/vite build --base=${cleanSub}/`;
+    const buildCmd = `NODE_ENV=development npm install --include=dev --legacy-peer-deps && ./node_modules/.bin/vite build --base=${cleanSub}/`;
     tool.buildCmd = buildCmd;
-    log(`Installation npm et compilation Vite (--base=${cleanSub}/) en cours...`);
+    log(`Installation npm (avec devDependencies) et compilation Vite (--base=${cleanSub}/) en cours...`);
     try {
       runCmdWithDetails(`cd "${tool.vmPath}" && ${buildCmd}`, log);
       log(`Compilation Vite réussie (dossier dist/ prêt).`);
@@ -530,7 +530,7 @@ function autoDetectBuildAndStartService(
     let useNodeBackend = false;
     if (hasServerTs) {
       const sContent = fs.readFileSync(serverTsFile, 'utf-8');
-      useNodeBackend = /['"`]\/?api\//.test(sContent);
+      useNodeBackend = /['"`]\/?api\b|apiRouter|express\s*\(/.test(sContent);
     }
 
     if (useNodeBackend) {
@@ -595,8 +595,14 @@ function autoDetectBuildAndStartService(
 
   runCmdWithDetails(`sudo systemctl restart ${tool.systemdUnit}`, log);
 
-  execSync('sleep 2');
-  const listening = isPortListening(tool.port);
+  let listening = false;
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    execSync('sleep 1');
+    if (isPortListening(tool.port)) {
+      listening = true;
+      break;
+    }
+  }
 
   if (!listening) {
     try {
@@ -1129,7 +1135,7 @@ async function startServer() {
     try {
       ensureSrvJeuPermissions();
       execSync(
-        `cd "${portalDir}" && git fetch origin main && git reset --hard origin/main && npm install --legacy-peer-deps && npm run build`
+        `cd "${portalDir}" && git fetch origin main && git reset --hard origin/main && NODE_ENV=development npm install --include=dev --legacy-peer-deps && npm run build`
       );
       const newCommit = execSync(`git -C "${portalDir}" rev-parse --short HEAD`, {
         encoding: 'utf-8',
