@@ -494,6 +494,80 @@ function patchNodeServerAndClientForSubpath(
 }
 
 /**
+ * Finds any TypeScript worker_threads files (e.g. src/server/simWorker.ts) and bundles them
+ * into native Node ESM (.mjs) with esbuild, updating references in src/ and server.ts so
+ * Node.js Worker threads never fail with ERR_UNKNOWN_FILE_EXTENSION (.ts).
+ */
+function compileTypeScriptWorkers(vmPath: string, log: (msg: string) => void) {
+  const esbuildBin = path.join(vmPath, 'node_modules', '.bin', 'esbuild');
+  if (!fs.existsSync(esbuildBin)) return;
+
+  const workerTsFiles: string[] = [];
+  const scanDir = (dir: string) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.git') {
+        continue;
+      }
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        scanDir(full);
+      } else if (/worker\.ts$/i.test(entry.name)) {
+        workerTsFiles.push(full);
+      }
+    }
+  };
+  scanDir(vmPath);
+
+  if (workerTsFiles.length === 0) return;
+
+  const compiledBasenames: Array<{ tsName: string; mjsName: string }> = [];
+  for (const wFile of workerTsFiles) {
+    const mjsFile = wFile.replace(/\.ts$/, '.mjs');
+    try {
+      runCmdWithDetails(
+        `"${esbuildBin}" "${wFile}" --bundle --platform=node --format=esm --outfile="${mjsFile}"`,
+        log
+      );
+      const tsBase = path.basename(wFile);
+      const mjsBase = path.basename(mjsFile);
+      compiledBasenames.push({ tsName: tsBase, mjsName: mjsBase });
+      log(`Worker multi-cœurs pré-compilé en JS natif : ${tsBase} -> ${mjsBase}`);
+    } catch (e: any) {
+      log(`Note compilation worker ${path.basename(wFile)} : ${e.message}`);
+    }
+  }
+
+  if (compiledBasenames.length === 0) return;
+
+  const rewriteWorkerRefs = (dir: string) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.git') {
+        continue;
+      }
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        rewriteWorkerRefs(full);
+      } else if (/\.(ts|tsx|js|mjs)$/.test(entry.name)) {
+        let content = fs.readFileSync(full, 'utf-8');
+        let changed = false;
+        for (const { tsName, mjsName } of compiledBasenames) {
+          if (content.includes(tsName)) {
+            content = content.split(tsName).join(mjsName);
+            changed = true;
+          }
+        }
+        if (changed) {
+          fs.writeFileSync(full, content, 'utf-8');
+        }
+      }
+    }
+  };
+  rewriteWorkerRefs(vmPath);
+}
+
+/**
  * Inspects the files inside tool.vmPath, builds the project, configures systemd,
  * starts the service, and verifies that the target port is actively listening.
  */
@@ -557,6 +631,9 @@ function autoDetectBuildAndStartService(
       }
     }
 
+    // Pre-compile any TypeScript worker_threads (e.g., simWorker.ts -> simWorker.mjs)
+    compileTypeScriptWorkers(tool.vmPath, log);
+
     const serverTsFile = path.join(tool.vmPath, 'server.ts');
     const hasServerTs = fs.existsSync(serverTsFile);
     if (hasServerTs) {
@@ -565,9 +642,9 @@ function autoDetectBuildAndStartService(
     }
 
     if (useNodeBackend) {
-      // Important: On Oracle Linux (SELinux Enforcing), systemd ExecStart must invoke /bin/bash (bin_t)
-      // and allocate 8GB heap so multi-core Monte-Carlo simulations and Worker threads run at full speed.
-      tool.execStart = `/bin/bash -lc "NODE_OPTIONS='--max-old-space-size=8192' exec ./node_modules/.bin/tsx server.ts"`;
+      // Important: On Oracle Linux (SELinux Enforcing), systemd ExecStart must invoke /bin/bash (bin_t),
+      // register tsx for any dynamic worker imports, and allocate 8GB heap for 16-vCPU campaigns.
+      tool.execStart = `/bin/bash -lc "NODE_OPTIONS='--import tsx --max-old-space-size=8192' exec ./node_modules/.bin/tsx server.ts"`;
       log(`Backend Node.js / Express (server.ts) détecté -> démarrage multi-cœurs sur le port ${tool.port}.`);
     } else {
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
