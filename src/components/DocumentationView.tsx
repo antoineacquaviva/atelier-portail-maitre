@@ -54,7 +54,7 @@ Tous les appels \`fetch()\` du frontend React vers le backend Express doivent ut
 ### C. Routage Frontend & Fichiers Statiques
 1. **Navigation interne** : Privilégier une navigation par état React (\`useState\`) ou \`HashRouter\`. Si \`BrowserRouter\` est utilisé, toujours lui passer \`basename={import.meta.env.BASE_URL}\`.
 2. **\`index.html\` propre** : Ne **jamais** écrire de balise \`<base href="...">\` en dur dans \`index.html\` (Vite gère automatiquement la réécriture des chemins d'assets via \`--base=/<sous-chemin>/\` lors du build de production).
-3. **Distribution de \`dist/\` en production dans \`server.ts\`** :
+3. **Distribution de \`dist/\` en production dans \`server.ts\`** (compatible ESM & Express 4/5) :
 \`\`\`ts
 if (process.env.NODE_ENV !== 'production') {
   const vite = await createViteServer({
@@ -63,9 +63,9 @@ if (process.env.NODE_ENV !== 'production') {
   });
   app.use(vite.middlewares);
 } else {
-  const distPath = path.join(__dirname, 'dist');
+  const distPath = path.join(process.cwd(), 'dist');
   app.use(express.static(distPath));
-  app.get('*', (_req, res) => {
+  app.use((_req, res) => {
     res.sendFile(path.join(distPath, 'index.html'));
   });
 }

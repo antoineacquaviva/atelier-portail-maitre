@@ -421,19 +421,34 @@ function patchNodeServerAndClientForSubpath(
   const serverTsPath = path.join(vmPath, 'server.ts');
   if (fs.existsSync(serverTsPath)) {
     let code = fs.readFileSync(serverTsPath, 'utf-8');
-    const updated = code
+    let updated = code
       .replace(
-        /const\s+PORT\s*=\s*3000\s*;/g,
-        `const PORT = Number(process.env.PORT) || ${port};`
-      )
-      .replace(
-        /const\s+port\s*=\s*3000\s*;/g,
-        `const port = Number(process.env.PORT) || ${port};`
+        /(const|let|var)\s+(PORT|port)(\s*:\s*number)?\s*=\s*3000\b/g,
+        `$1 $2$3 = Number(process.env.PORT) || ${port}`
       )
       .replace(/\.listen\(\s*3000\b/g, `.listen(Number(process.env.PORT) || ${port}`);
+
+    // Prevent ESM ReferenceError: __dirname is not defined when NODE_ENV=production
+    if (
+      updated.includes('__dirname') &&
+      !updated.includes('fileURLToPath') &&
+      !/\b(const|let|var)\s+__dirname\b/.test(updated)
+    ) {
+      updated = updated
+        .replace(/path\.join\(\s*__dirname\b/g, 'path.join(process.cwd()')
+        .replace(/path\.resolve\(\s*__dirname\b/g, 'path.resolve(process.cwd()');
+      log(`Correction ESM automatique : __dirname remplacé par process.cwd() dans server.ts.`);
+    }
+
+    // Prevent Express 5 path-to-regexp crash on app.get('*', ...) in production mode
+    if (/app\.get\(\s*['"]\/?\*['"]\s*,/.test(updated)) {
+      updated = updated.replace(/app\.get\(\s*['"]\/?\*['"]\s*,/g, 'app.use(');
+      log(`Compatibilité Express 5 appliquée : app.get('*') converti en app.use() dans server.ts.`);
+    }
+
     if (updated !== code) {
       fs.writeFileSync(serverTsPath, updated, 'utf-8');
-      log(`Port 3000 dans server.ts automatiquement adapté vers le port ${port}.`);
+      log(`Adaptation automatique de server.ts appliquée (Port ${port} & mode production).`);
     }
   }
 
@@ -481,6 +496,8 @@ function autoDetectBuildAndStartService(
     ? '/home/opc/venv/bin/python3'
     : '/usr/bin/python3';
 
+  let useNodeBackend = false;
+
   if (fs.existsSync(pkgJsonPath)) {
     log(`Projet Node.js / Vite détecté dans ${tool.vmPath}.`);
     tool.stackPreset = 'node';
@@ -527,21 +544,19 @@ function autoDetectBuildAndStartService(
 
     const serverTsFile = path.join(tool.vmPath, 'server.ts');
     const hasServerTs = fs.existsSync(serverTsFile);
-    let useNodeBackend = false;
     if (hasServerTs) {
       const sContent = fs.readFileSync(serverTsFile, 'utf-8');
       useNodeBackend = /['"`]\/?api\b|apiRouter|express\s*\(/.test(sContent);
     }
 
     if (useNodeBackend) {
-      const tsxBin = fs.existsSync(path.join(tool.vmPath, 'node_modules/.bin/tsx'))
-        ? path.join(tool.vmPath, 'node_modules/.bin/tsx')
-        : '/usr/bin/npx tsx';
-      tool.execStart = `${tsxBin} ${tool.vmPath}/server.ts`;
-      log(`Backend API server.ts détecté -> démarrage sur le port ${tool.port}.`);
+      // Important: On Oracle Linux (SELinux Enforcing), systemd ExecStart must invoke /bin/bash (bin_t)
+      // rather than directly executing a script inside /srv/jeu/.../node_modules/.bin/tsx (which triggers status=203/EXEC).
+      tool.execStart = `/bin/bash -lc "exec ./node_modules/.bin/tsx server.ts"`;
+      log(`Backend Node.js / Express (server.ts) détecté -> démarrage multi-cœurs sur le port ${tool.port}.`);
     } else {
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
-      log(`Application Vite SPA -> servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`);
+      log(`Application Vite SPA pure -> servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`);
     }
   } else if (fs.existsSync(appPyPath) || fs.existsSync(mainPyPath)) {
     const pyEntry = fs.existsSync(appPyPath) ? 'app.py' : 'main.py';
@@ -587,8 +602,10 @@ function autoDetectBuildAndStartService(
     log
   );
 
+  // Stop existing service and free the TCP port in case an old python3 http.server is still holding it
   try {
     execSync(`sudo systemctl stop ${tool.systemdUnit} || true`);
+    execSync(`sudo fuser -k ${tool.port}/tcp || true`);
   } catch {
     // ignore
   }
@@ -596,7 +613,7 @@ function autoDetectBuildAndStartService(
   runCmdWithDetails(`sudo systemctl restart ${tool.systemdUnit}`, log);
 
   let listening = false;
-  for (let attempt = 1; attempt <= 10; attempt++) {
+  for (let attempt = 1; attempt <= 12; attempt++) {
     execSync('sleep 1');
     if (isPortListening(tool.port)) {
       listening = true;
@@ -607,7 +624,7 @@ function autoDetectBuildAndStartService(
   if (!listening) {
     try {
       const crashLogs = execSync(
-        `sudo journalctl -u ${tool.systemdUnit} -n 15 --no-pager -o cat`,
+        `sudo journalctl -u ${tool.systemdUnit} -n 25 --no-pager -o cat`,
         { encoding: 'utf-8' }
       ).trim();
       if (crashLogs) {
@@ -617,10 +634,12 @@ function autoDetectBuildAndStartService(
       // ignore
     }
 
+    // NEVER fallback to python3 http.server if the project has a Node.js backend (server.ts),
+    // because SimpleHTTP Python returns 404 on /api/* and forces local browser fallback!
     const distIndex = path.join(tool.vmPath, 'dist', 'index.html');
-    if (fs.existsSync(distIndex)) {
+    if (!useNodeBackend && fs.existsSync(distIndex)) {
       log(
-        `Auto-réparation : bascule automatique sur le serveur statique dist/ (port ${tool.port}) pour éviter toute erreur.`
+        `Auto-réparation SPA sans backend : bascule sur le serveur statique dist/ (port ${tool.port}).`
       );
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
       const fallbackUnit = generateSystemdUnitFile(tool);
@@ -630,6 +649,18 @@ function autoDetectBuildAndStartService(
         log
       );
       execSync('sleep 1');
+    }
+  } else if (useNodeBackend) {
+    // Verify that Express (not SimpleHTTP Python) is answering on the port
+    try {
+      const headers = execSync(
+        `curl -sI http://127.0.0.1:${tool.port}/api/health || curl -sI http://127.0.0.1:${tool.port}/`,
+        { encoding: 'utf-8' }
+      ).trim();
+      const firstLines = headers.split('\n').slice(0, 4).join(' | ');
+      log(`Vérification Backend Node.js sur 127.0.0.1:${tool.port} : ${firstLines}`);
+    } catch {
+      // ignore
     }
   }
 
@@ -646,7 +677,7 @@ function autoDetectBuildAndStartService(
 
 /**
  * On Portal startup on the Oracle VM, automatically sync Caddyfile and repair any newly registered
- * tool whose directory was blocked by /srv/jeu permissions (such as Amazonia).
+ * tool whose directory was blocked by /srv/jeu permissions or whose Node backend was downgraded to http.server.
  */
 function autoHealToolsOnStartup() {
   if (!isOracleVm) return;
@@ -662,7 +693,15 @@ function autoHealToolsOnStartup() {
             !fs.existsSync(path.join(tool.vmPath, 'app.py')) &&
             !fs.existsSync(path.join(tool.vmPath, 'index.html')));
 
-        if (missingRepo || (tool.status === 'active' && !isPortListening(tool.port))) {
+        const hasNodeServerTs = fs.existsSync(path.join(tool.vmPath, 'server.ts'));
+        const stuckOnPythonStatic =
+          hasNodeServerTs && tool.execStart.includes('http.server');
+
+        if (
+          missingRepo ||
+          stuckOnPythonStatic ||
+          (tool.status === 'active' && !isPortListening(tool.port))
+        ) {
           const log = (msg: string) => {
             tool.logs.push(`[${nowTime()}] [Auto-Repair] ${msg}`);
           };
