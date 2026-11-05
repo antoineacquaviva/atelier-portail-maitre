@@ -367,7 +367,10 @@ WantedBy=multi-user.target
 }
 
 function applySubpathPatchInDirectory(targetDir: string, subpath: string) {
-  if (fs.existsSync(path.join(targetDir, 'package.json'))) {
+  const hasViteConfig =
+    fs.existsSync(path.join(targetDir, 'vite.config.ts')) ||
+    fs.existsSync(path.join(targetDir, 'vite.config.js'));
+  if (fs.existsSync(path.join(targetDir, 'package.json')) && hasViteConfig && !fs.existsSync(path.join(targetDir, 'templates', 'index.html'))) {
     return;
   }
 
@@ -588,11 +591,16 @@ function autoDetectBuildAndStartService(
   let useNodeBackend = false;
 
   if (fs.existsSync(pkgJsonPath)) {
-    log(`Projet Node.js / Vite détecté dans ${tool.vmPath}.`);
+    log(`Projet Node.js détecté dans ${tool.vmPath}.`);
     tool.stackPreset = 'node';
 
+    const hasViteConfig =
+      fs.existsSync(path.join(tool.vmPath, 'vite.config.ts')) ||
+      fs.existsSync(path.join(tool.vmPath, 'vite.config.js')) ||
+      fs.existsSync(path.join(tool.vmPath, 'src'));
+
     const srcIndexHtml = path.join(tool.vmPath, 'index.html');
-    if (fs.existsSync(srcIndexHtml)) {
+    if (fs.existsSync(srcIndexHtml) && hasViteConfig) {
       const content = fs.readFileSync(srcIndexHtml, 'utf-8');
       if (content.includes('<base href=')) {
         fs.writeFileSync(
@@ -604,31 +612,41 @@ function autoDetectBuildAndStartService(
     }
 
     patchNodeServerAndClientForSubpath(tool.vmPath, tool.port, cleanSub, log);
-
-    const distDir = path.join(tool.vmPath, 'dist');
-    const backupDist = `/tmp/dist_backup_${tool.id}`;
-    if (fs.existsSync(distDir)) {
-      try {
-        execSync(`rm -rf "${backupDist}" && cp -r "${distDir}" "${backupDist}"`);
-      } catch {
-        // ignore
-      }
+    if (autoSubpathPatch && fs.existsSync(path.join(tool.vmPath, 'templates', 'index.html'))) {
+      applySubpathPatchInDirectory(tool.vmPath, cleanSub);
     }
 
-    const buildCmd = `NODE_ENV=development npm install --include=dev --legacy-peer-deps && ./node_modules/.bin/vite build --base=${cleanSub}/`;
-    tool.buildCmd = buildCmd;
-    log(`Installation npm (avec devDependencies) et compilation Vite (--base=${cleanSub}/) en cours...`);
-    try {
-      runCmdWithDetails(`cd "${tool.vmPath}" && ${buildCmd}`, log);
-      log(`Compilation Vite réussie (dossier dist/ prêt).`);
-    } catch (buildErr: any) {
-      log(`Alerte Build Vite : ${buildErr.message}`);
-      if (fs.existsSync(backupDist) && !fs.existsSync(path.join(distDir, 'index.html'))) {
-        execSync(`rm -rf "${distDir}" && cp -r "${backupDist}" "${distDir}"`);
-        log(`Ancien dossier dist/ restauré pour éviter une coupure de service.`);
-      } else {
-        throw buildErr;
+    if (hasViteConfig) {
+      const distDir = path.join(tool.vmPath, 'dist');
+      const backupDist = `/tmp/dist_backup_${tool.id}`;
+      if (fs.existsSync(distDir)) {
+        try {
+          execSync(`rm -rf "${backupDist}" && cp -r "${distDir}" "${backupDist}"`);
+        } catch {
+          // ignore
+        }
       }
+
+      const buildCmd = `NODE_ENV=development npm install --include=dev --legacy-peer-deps && ./node_modules/.bin/vite build --base=${cleanSub}/`;
+      tool.buildCmd = buildCmd;
+      log(`Installation npm (avec devDependencies) et compilation Vite (--base=${cleanSub}/) en cours...`);
+      try {
+        runCmdWithDetails(`cd "${tool.vmPath}" && ${buildCmd}`, log);
+        log(`Compilation Vite réussie (dossier dist/ prêt).`);
+      } catch (buildErr: any) {
+        log(`Alerte Build Vite : ${buildErr.message}`);
+        if (fs.existsSync(backupDist) && !fs.existsSync(path.join(distDir, 'index.html'))) {
+          execSync(`rm -rf "${distDir}" && cp -r "${backupDist}" "${distDir}"`);
+          log(`Ancien dossier dist/ restauré pour éviter une coupure de service.`);
+        } else {
+          throw buildErr;
+        }
+      }
+    } else {
+      const installCmd = `NODE_ENV=development npm install --include=dev --legacy-peer-deps`;
+      tool.buildCmd = installCmd;
+      log(`Installation des dépendances Node.js (Express/Sharp sans Vite) en cours...`);
+      runCmdWithDetails(`cd "${tool.vmPath}" && ${installCmd}`, log);
     }
 
     // Pre-compile any TypeScript worker_threads (e.g., simWorker.ts -> simWorker.mjs)
@@ -645,7 +663,7 @@ function autoDetectBuildAndStartService(
       // Important: On Oracle Linux (SELinux Enforcing), systemd ExecStart must invoke /bin/bash (bin_t),
       // register tsx for any dynamic worker imports, and allocate 8GB heap for 16-vCPU campaigns.
       tool.execStart = `/bin/bash -lc "NODE_OPTIONS='--import tsx --max-old-space-size=8192' exec ./node_modules/.bin/tsx server.ts"`;
-      log(`Backend Node.js / Express (server.ts) détecté -> démarrage multi-cœurs sur le port ${tool.port}.`);
+      log(`Backend Node.js / Express (server.ts) détecté -> démarrage sur le port ${tool.port}.`);
     } else {
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
       log(`Application Vite SPA pure -> servie sur 127.0.0.1:${tool.port} depuis ${tool.vmPath}/dist.`);
