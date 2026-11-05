@@ -416,8 +416,12 @@ function applySubpathPatchInDirectory(targetDir: string, subpath: string) {
 function patchNodeServerAndClientForSubpath(
   vmPath: string,
   port: number,
+  subpath: string,
   log: (msg: string) => void
 ) {
+  const cleanSub = subpath.startsWith('/')
+    ? subpath.replace(/\/+$/, '')
+    : `/${subpath.replace(/\/+$/, '')}`;
   const serverTsPath = path.join(vmPath, 'server.ts');
   if (fs.existsSync(serverTsPath)) {
     let code = fs.readFileSync(serverTsPath, 'utf-8');
@@ -446,9 +450,17 @@ function patchNodeServerAndClientForSubpath(
       log(`Compatibilité Express 5 appliquée : app.get('*') converti en app.use() dans server.ts.`);
     }
 
+    // Ensure Express accepts both /api/* and /<subpath>/api/* requests seamlessly
+    if (cleanSub && !updated.includes('__als_subpath_strip')) {
+      updated = updated.replace(
+        /(const\s+app\s*=\s*express\(\s*\)\s*;?)/,
+        `$1\n  // __als_subpath_strip\n  app.use((req, _res, next) => { if (req.url.startsWith('${cleanSub}/')) { req.url = req.url.slice(${cleanSub.length}) || '/'; } next(); });`
+      );
+    }
+
     if (updated !== code) {
       fs.writeFileSync(serverTsPath, updated, 'utf-8');
-      log(`Adaptation automatique de server.ts appliquée (Port ${port} & mode production).`);
+      log(`Adaptation automatique de server.ts appliquée (Port ${port} & sous-chemin ${cleanSub}).`);
     }
   }
 
@@ -463,7 +475,10 @@ function patchNodeServerAndClientForSubpath(
           const orig = fs.readFileSync(fullPath, 'utf-8');
           const next = orig
             .replace(/fetch\(\s*['"]\/api\//g, (m) => m.replace('/api/', 'api/'))
-            .replace(/fetch\(\s*`\/api\//g, 'fetch(`api/');
+            .replace(/fetch\(\s*`\/api\//g, 'fetch(`api/')
+            // Increase aggressive AbortSignal / AbortController timeouts (1s-3s -> 15s) so heavy VM CPU load never triggers NetworkError
+            .replace(/AbortSignal\.timeout\(\s*(1\d{3}|2\d{3}|3000)\s*\)/g, 'AbortSignal.timeout(15000)')
+            .replace(/\.abort\(\s*\)\s*,\s*(1\d{3}|2\d{3}|3000)\s*\)/g, '.abort(), 15000)');
           if (next !== orig) {
             fs.writeFileSync(fullPath, next, 'utf-8');
           }
@@ -514,7 +529,7 @@ function autoDetectBuildAndStartService(
       }
     }
 
-    patchNodeServerAndClientForSubpath(tool.vmPath, tool.port, log);
+    patchNodeServerAndClientForSubpath(tool.vmPath, tool.port, cleanSub, log);
 
     const distDir = path.join(tool.vmPath, 'dist');
     const backupDist = `/tmp/dist_backup_${tool.id}`;
@@ -551,8 +566,8 @@ function autoDetectBuildAndStartService(
 
     if (useNodeBackend) {
       // Important: On Oracle Linux (SELinux Enforcing), systemd ExecStart must invoke /bin/bash (bin_t)
-      // rather than directly executing a script inside /srv/jeu/.../node_modules/.bin/tsx (which triggers status=203/EXEC).
-      tool.execStart = `/bin/bash -lc "exec ./node_modules/.bin/tsx server.ts"`;
+      // and allocate 8GB heap so multi-core Monte-Carlo simulations and Worker threads run at full speed.
+      tool.execStart = `/bin/bash -lc "NODE_OPTIONS='--max-old-space-size=8192' exec ./node_modules/.bin/tsx server.ts"`;
       log(`Backend Node.js / Express (server.ts) détecté -> démarrage multi-cœurs sur le port ${tool.port}.`);
     } else {
       tool.execStart = `/usr/bin/python3 -m http.server ${tool.port} --bind 127.0.0.1 --directory ${tool.vmPath}/dist`;
@@ -651,14 +666,15 @@ function autoDetectBuildAndStartService(
       execSync('sleep 1');
     }
   } else if (useNodeBackend) {
-    // Verify that Express (not SimpleHTTP Python) is answering on the port
+    // Verify that Express (not SimpleHTTP Python) is answering on the port and log its JSON health payload
     try {
-      const headers = execSync(
-        `curl -sI http://127.0.0.1:${tool.port}/api/health || curl -sI http://127.0.0.1:${tool.port}/`,
+      const healthBody = execSync(
+        `curl -s -m 4 http://127.0.0.1:${tool.port}/api/health || true`,
         { encoding: 'utf-8' }
       ).trim();
-      const firstLines = headers.split('\n').slice(0, 4).join(' | ');
-      log(`Vérification Backend Node.js sur 127.0.0.1:${tool.port} : ${firstLines}`);
+      if (healthBody) {
+        log(`Réponse JSON GET http://127.0.0.1:${tool.port}/api/health : ${healthBody.slice(0, 260)}`);
+      }
     } catch {
       // ignore
     }
@@ -832,12 +848,32 @@ async function startServer() {
           }
 
           try {
+            const preHealth = execSync(
+              `curl -i -s -m 4 http://127.0.0.1:${tool.port}/api/health || echo "TIMEOUT_OR_REFUSED"`,
+              { encoding: 'utf-8' }
+            ).trim();
+            log(`État direct 127.0.0.1:${tool.port}/api/health avant réparation :\n${preHealth.slice(0, 350)}`);
+          } catch {
+            // ignore
+          }
+
+          try {
+            const caddyHealth = execSync(
+              `curl -i -s -k -m 4 https://127.0.0.1${tool.subpath}/api/health -H "Host: atelierconceptionjeu.fr" || echo "CADDY_TIMEOUT_OR_REFUSED"`,
+              { encoding: 'utf-8' }
+            ).trim();
+            log(`État via Caddy https://atelierconceptionjeu.fr${tool.subpath}/api/health avant réparation :\n${caddyHealth.slice(0, 350)}`);
+          } catch {
+            // ignore
+          }
+
+          try {
             const jOut = execSync(
-              `sudo journalctl -u ${tool.systemdUnit} -n 20 --no-pager -o cat`,
+              `sudo journalctl -u ${tool.systemdUnit} -n 30 --no-pager -o cat`,
               { encoding: 'utf-8' }
             ).trim();
             if (jOut) {
-              log(`Derniers logs systemd (${tool.systemdUnit}) :\n${jOut}`);
+              log(`Derniers logs systemd (${tool.systemdUnit}) avant redémarrage :\n${jOut}`);
             }
           } catch {
             // ignore
@@ -1198,18 +1234,40 @@ async function startServer() {
     }
   });
 
-  // 6. Built-in Subpath Reverse-Proxy Fallback (Prevents the Portal from ever serving its own index.html on /amazonia/, /lab/, etc.)
+  // 6. Built-in Subpath & Referer-Aware API Reverse-Proxy
+  // Routes both /<subpath>/* AND any root /api/* call coming from a tool page (e.g. /api/health, /api/campaigns) to the right tool port!
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api/')) {
-      next();
-      return;
-    }
-
-    const matchedTool = toolsState.find((t) => {
+    let matchedTool = toolsState.find((t) => {
       const cleanSub = t.subpath.replace(/\/+$/, '');
       if (!cleanSub) return false;
       return req.path === cleanSub || req.path.startsWith(`${cleanSub}/`);
     });
+
+    let targetPath = req.originalUrl;
+
+    if (matchedTool) {
+      const cleanSub = matchedTool.subpath.replace(/\/+$/, '');
+      if (req.path === cleanSub && !req.originalUrl.startsWith(`${cleanSub}/`)) {
+        res.redirect(302, `${cleanSub}/`);
+        return;
+      }
+      targetPath = req.originalUrl.slice(cleanSub.length) || '/';
+    } else if (
+      req.path.startsWith('/api/') &&
+      !req.path.startsWith('/api/overview') &&
+      !req.path.startsWith('/api/tools') &&
+      !req.path.startsWith('/api/portal')
+    ) {
+      const referer = String(req.headers.referer || '');
+      matchedTool =
+        toolsState.find((t) => {
+          const cleanSub = t.subpath.replace(/\/+$/, '');
+          return cleanSub && referer.includes(`${cleanSub}`);
+        }) ||
+        toolsState.find((t) => t.id === 'amazonia') ||
+        toolsState.find((t) => t.stackPreset === 'node' && t.status === 'active');
+      targetPath = req.originalUrl;
+    }
 
     if (!matchedTool) {
       next();
@@ -1217,12 +1275,7 @@ async function startServer() {
     }
 
     const cleanSub = matchedTool.subpath.replace(/\/+$/, '');
-    if (req.path === cleanSub && !req.originalUrl.startsWith(`${cleanSub}/`)) {
-      res.redirect(302, `${cleanSub}/`);
-      return;
-    }
-
-    const strippedUrl = req.originalUrl.slice(cleanSub.length) || '/';
+    const strippedUrl = targetPath;
 
     const proxyReq = http.request(
       {
