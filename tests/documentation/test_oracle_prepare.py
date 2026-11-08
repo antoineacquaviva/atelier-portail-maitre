@@ -1,0 +1,355 @@
+"""Local fixtures only. Never invokes the production CLI against Oracle paths."""
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts'
+sys.path.insert(0, str(SCRIPTS))
+import oracle_prepare as p
+import oracle_provision as provision
+
+
+def snapshot(root):
+    result = {}
+    for f in [root, *sorted(root.rglob('*'))]:
+        s = f.lstat()
+        result[str(f.relative_to(root))] = (s.st_mode, s.st_uid, s.st_gid, s.st_size, s.st_mtime_ns,
+                                           p.sha(f) if f.is_file() and not f.is_symlink() else None)
+    return result
+
+
+class Fixtures(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='oracle-P-fixtures-')
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.history = self.base / 'historical-backup'
+        data = self.history / 'data'
+        (data / 'campaigns').mkdir(parents=True)
+        (data / 'editions').mkdir()
+        (data / 'seeds').mkdir()
+        for i in range(2):
+            record = {'id': f'compatible-{i}', 'status': 'COMPLETED',
+                      'startedAt': f'2026-11-0{i+1}T00:00:00Z',
+                      'config': {'type': 'MONTE_CARLO_SWEEP', 'sweep': {'parryHsRuleValues': ['SYNERGY_TRAP_SAB']}},
+                      'variantResults': [], 'progress': {'completedGames': 10 * (i+1)}}
+            (data / 'campaigns' / f'compatible-{i}.json').write_text(json.dumps(record))
+        for i in range(7):
+            (data / 'campaigns' / f'old-{i}.json').write_text(json.dumps({'incompatible': i}))
+        for i in range(2):
+            (data / 'campaigns' / f'empty-{i}.json').write_bytes(b'')
+        for i in range(5):
+            (data / ('editions' if i < 2 else 'seeds') / f'{i}.json').write_text('{}')
+        self.backup = self.base / 'complementary-backup'
+        self.backup.mkdir()
+        self.backup.chmod(0o700)
+        self.history.chmod(0o700)
+        self.registry = self.base / 'registry.json'
+        tools = [{'id': str(i), 'subpath': n, 'port': port, 'private': 'DO_NOT_PRINT_SECRET'}
+                 for i, (n, port) in enumerate(p.ROUTES.items())]
+        self.registry.write_text(json.dumps(tools))
+        (self.backup / 'registre.json').write_bytes(self.registry.read_bytes())
+        for n in ('applications.tar', 'configurations.tar'):
+            with tarfile.open(self.backup / n, 'w') as t:
+                b = b'DO_NOT_PRINT_SECRET'
+                info = tarfile.TarInfo('preserved/config.txt')
+                info.size = len(b)
+                t.addfile(info, io.BytesIO(b))
+        (self.backup / 'SHA256SUMS').write_text(''.join(p.sha(self.backup / n) + '  ' + n + '\n' for n in p.NAMES))
+        self.c = {'workspace': str(self.base / 'preparation'), 'node_version': 'v24.22.1',
+                  'node_sha256': 'a' * 64, 'disk_budget_gib': 6}
+        self.prep = p.Preparation(self.c, self.backup, self.history, self.registry)
+        self.initial_backup = snapshot(self.backup)
+        self.initial_history = snapshot(self.history)
+
+    def opened(self):
+        self.prep.initial = self.prep.inputs()
+        return self.prep.open()
+
+    def test_checks_are_read_only_and_disk_checked_before_write(self):
+        with patch.object(p, 'disk_check', side_effect=p.Stop('DISK_BUDGET')):
+            with self.assertRaisesRegex(p.Stop, 'DISK_BUDGET'):
+                self.prep.checks(oracle=False)
+        self.assertFalse(self.prep.root.exists())
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        self.assertEqual(snapshot(self.history), self.initial_history)
+
+    def test_existing_backups_checksum_and_archive_errors(self):
+        self.prep.inputs()
+        (self.backup / 'applications.tar').write_bytes(b'broken')
+        with self.assertRaisesRegex(p.Stop, 'CHECKSUM'):
+            self.prep.inputs()
+        with self.assertRaises(tarfile.TarError):
+            p.archive_size(self.backup / 'applications.tar')
+
+    def test_permissions_and_foreign_destinations_refused(self):
+        self.prep.root.mkdir()
+        (self.prep.root / 'keep').write_text('preserve')
+        with self.assertRaises(p.Stop):
+            self.prep.open()
+        self.assertEqual((self.prep.root / 'keep').read_text(), 'preserve')
+        self.prep.root.chmod(0o700)
+        with self.assertRaisesRegex(p.Stop, 'WORKSPACE_UNOWNED'):
+            self.prep.open()
+
+    def test_resume_completed_steps_verified_not_reexecuted(self):
+        prep = self.opened()
+        with patch.object(p, 'disk_check'):
+            prep.step('first', ['first.txt'], lambda: p.write_new(prep.root / 'first.txt', 'complete'))
+            def interrupted():
+                raise InterruptedError()
+            with self.assertRaises(InterruptedError):
+                prep.step('second', ['second.txt'], interrupted)
+        again = p.Preparation(self.c, self.backup, self.history, self.registry)
+        again.initial = again.inputs()
+        again.open()
+        with patch.object(p, 'disk_check'):
+            again.step('first', ['first.txt'], lambda: self.fail('completed operation repeated'))
+            again.step('second', ['second.txt'], lambda: p.write_new(prep.root / 'second.txt', 'recovered'))
+        (prep.root / 'first.txt').write_text('changed')
+        with self.assertRaisesRegex(p.Stop, 'STEP_OUTPUT_CHANGED'):
+            again.step('first', ['first.txt'], lambda: None)
+
+    def test_interrupted_state_publication_and_lock_source_changes(self):
+        prep = self.opened()
+        p.write_new(prep.root / 'state.json.next', 'interrupted write')
+        p.atomic(prep.root / 'state.json', {'inputs': prep.initial, 'config': self.c, 'steps': {}})
+        self.assertEqual((prep.root / 'state.json.next').read_text(), 'interrupted write')
+        (self.registry).write_text('[]')
+        with self.assertRaises(p.Stop):
+            prep.inputs()
+
+    def test_safe_report_no_raw_errors_or_registry_secrets(self):
+        prep = self.opened()
+        prep.phase = 'restoration'
+        prep.report('HISTORY_LOAD_FAILED')
+        report = (prep.root / 'report.txt').read_text() + (prep.root / 'report.json').read_text()
+        self.assertNotIn('DO_NOT_PRINT_SECRET', report)
+        self.assertNotIn(str(self.registry), report)
+        self.assertFalse(json.loads((prep.root / 'report.json').read_text())['ready_for_deployment'])
+        with patch.object(p, 'disk_check'):
+            first = prep.bundle(include_products=False)
+            second = prep.bundle(include_products=False)
+        self.assertEqual(first, second)  # unchanged, fully verified export reused
+        p.sums(first / 'SHA256SUMS', first, ('report.json', 'report.txt', 'preparation.tar'))
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        (first / 'preparation.tar').write_bytes(b'tampered')
+        with self.assertRaisesRegex(p.Stop, 'CHECKSUM_MISMATCH'):
+            prep.bundle(include_products=False)
+
+    def test_download_failure_checksum_and_exclusive_destination(self):
+        dest = self.base / 'node.tar.xz'
+        with patch.object(p.urllib.request, 'urlopen', side_effect=OSError('DO_NOT_PRINT_SECRET')):
+            with self.assertRaisesRegex(p.Stop, '^DOWNLOAD_FAILED$'):
+                p.download('https://nodejs.org/dist/v24.22.1/node.tar.xz', dest, 'a'*64)
+        class Response(io.BytesIO):
+            def geturl(self):
+                return 'https://nodejs.org/dist/v24.22.1/node.tar.xz'
+        with patch.object(p.urllib.request, 'urlopen', return_value=Response(b'wrong')):
+            with self.assertRaisesRegex(p.Stop, 'DOWNLOAD_CHECKSUM'):
+                p.download('https://nodejs.org/dist/v24.22.1/node.tar.xz', dest, 'a'*64)
+        self.assertFalse(dest.exists())
+        with patch.object(p.urllib.request, 'urlopen', return_value=Response(b'right')):
+            p.download('https://nodejs.org/dist/v24.22.1/node.tar.xz', dest, hashlib.sha256(b'right').hexdigest())
+        before = snapshot(dest.parent)
+        with self.assertRaisesRegex(p.Stop, 'DOWNLOAD_EXISTING'):
+            p.download('https://nodejs.org/dist/v24.22.1/node.tar.xz', dest, 'a'*64)
+        self.assertEqual(snapshot(dest.parent), before)
+
+    def test_node_extraction_resume_rejects_traversal_and_foreign_content(self):
+        archive = self.base / 'node.tar.xz'
+        with tarfile.open(archive, 'w:xz') as t:
+            for n, data in [('node-v24.22.1-linux-x64', None), ('node-v24.22.1-linux-x64/bin', None), ('node-v24.22.1-linux-x64/bin/node', b'fixture')]:
+                i = tarfile.TarInfo(n)
+                if data is None:
+                    i.type = tarfile.DIRTYPE
+                else:
+                    i.size = len(data)
+                t.addfile(i, None if data is None else io.BytesIO(data))
+        target = self.base / 'node'
+        p.extract_node(archive, target, 'v24.22.1')
+        p.extract_node(archive, target, 'v24.22.1')
+        (target / 'bin/node').write_text('foreign')
+        with self.assertRaisesRegex(p.Stop, 'NODE_TARGET_DIFFERENT'):
+            p.extract_node(archive, target, 'v24.22.1')
+        evil = self.base / 'evil.tar.xz'
+        with tarfile.open(evil, 'w:xz') as t:
+            i = tarfile.TarInfo('node-v24.22.1-linux-x64/../../escape')
+            i.size = 0
+            t.addfile(i, io.BytesIO())
+        with self.assertRaisesRegex(p.Stop, 'NODE_ARCHIVE_PATH'):
+            p.extract_node(evil, self.base / 'evil', 'v24.22.1')
+        self.assertFalse((self.base / 'escape').exists())
+
+    def test_dedicated_existing_directory_is_never_chowned_or_chmodded(self):
+        user = type('User', (), {'pw_uid': os.getuid(), 'pw_gid': os.getgid()})()
+        dest = self.base / 'dedicated'
+        with patch.object(provision.os, 'chown') as chown:
+            provision.dedicated(dest, user)
+            self.assertEqual(chown.call_count, 1)
+            provision.dedicated(dest, user)
+            self.assertEqual(chown.call_count, 1)
+            dest.chmod(0o755)
+            with self.assertRaisesRegex(p.Stop, 'EXISTING_DIRECTORY_REVIEW'):
+                provision.dedicated(dest, user)
+            self.assertEqual(stat_mode(dest), 0o755)
+
+    def test_history_layout_links_counts_and_empty_files(self):
+        self.assertEqual(len(p.history_inventory(self.history / 'data')), 16)
+        with self.assertRaises(p.Stop):
+            p.history_inventory(self.history / 'campaigns')
+        empty = self.history / 'data/campaigns/empty-0.json'
+        empty.write_text('changed')
+        with self.assertRaisesRegex(p.Stop, 'HISTORY_EMPTY_FILES'):
+            p.history_inventory(self.history / 'data')
+
+    def test_neighbors_and_backups_unchanged_on_preparation_failure(self):
+        neighbors = self.base / 'neighbors'
+        for n in ('lora', 'foret', 'bga'):
+            (neighbors / n).mkdir(parents=True)
+            (neighbors / n / 'unchanged').write_text('keep')
+        before = snapshot(neighbors)
+        prep = self.opened()
+        with patch.object(prep, 'node', side_effect=p.Stop('DOWNLOAD_FAILED')), patch.object(p, 'disk_check'):
+            with self.assertRaisesRegex(p.Stop, 'DOWNLOAD_FAILED'):
+                prep.run()
+        self.assertEqual(snapshot(neighbors), before)
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        self.assertEqual(snapshot(self.history), self.initial_history)
+
+    def test_whole_orchestration_resumes_after_build_failure(self):
+        prep = self.opened()
+        calls = []
+        def node():
+            calls.append('node')
+            (prep.root / 'runtime').mkdir()
+            p.write_new(prep.root / 'runtime/verified', 'node')
+        def build(name, commit):
+            calls.append(name)
+            if name == 'portail.next' and calls.count(name) == 1:
+                raise p.Stop('COMMAND_FAILED')
+            (prep.root / name).mkdir()
+            p.write_new(prep.root / name / 'commit', commit)
+            p.write_new(prep.root / (name + '.dependencies.json'), '{}')
+        def restore():
+            (prep.root / 'restore-0').mkdir()
+            shutil.copytree(self.history / 'data', prep.root / 'restore-0/data')
+            p.write_new(prep.root / 'restoration.json', json.dumps({
+                'directory': 'restore-0', 'digest': p.tree_digest(prep.root / 'restore-0')}))
+        def candidates():
+            (prep.root / 'candidates').mkdir()
+            p.write_new(prep.root / 'candidates/inactive', 'no activation')
+            p.write_new(prep.root / 'registry.copy.json', self.registry.read_text())
+        with patch.object(prep, 'node', side_effect=node), patch.object(prep, 'clone_build', side_effect=build), \
+             patch.object(prep, 'restore', side_effect=restore), patch.object(prep, 'candidates', side_effect=candidates), \
+             patch.object(p, 'disk_check'):
+            with self.assertRaisesRegex(p.Stop, 'COMMAND_FAILED'):
+                prep.run()
+            self.assertFalse(json.loads((prep.root / 'report.json').read_text())['success'])
+            prep.run()
+            self.assertTrue(json.loads((prep.root / 'report.json').read_text())['success'])
+            prep.run()
+        self.assertEqual(calls.count('node'), 1)
+        self.assertEqual(calls.count('amazonia.next'), 1)
+        self.assertEqual(calls.count('portail.next'), 2)
+        self.assertEqual(p.sha(prep.root / 'registry.copy.json'), p.sha(self.registry))
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        self.assertEqual(snapshot(self.history), self.initial_history)
+
+    def test_exclusive_lock_prevents_second_preparation(self):
+        prep = self.opened()
+        p.write_new(prep.root / 'lock', '')
+        with (prep.root / 'lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(p.Stop, 'PREPARATION_RUNNING'):
+                prep.run()
+
+    @unittest.skipUnless(os.environ.get('TSX_FIXTURE_PACKAGE'), 'tsx fixture not configured')
+    def test_real_caddy_candidates_preserve_four_routes_and_bga(self):
+        prep = self.opened()
+        tools = []
+        for route, port in p.ROUTES.items():
+            name = route[1:]
+            tools.append({'id': name, 'name': name, 'subpath': route, 'port': port,
+                          'repo': 'antoineacquaviva/' + ('Amazonia' if name == 'amazonia' else name),
+                          'branch': 'main', 'vmPath': '/srv/jeu/' + name,
+                          'systemdUnit': name + '.service'})
+        # This separate test defines a new fixture baseline, never a live registry.
+        self.registry.write_text(json.dumps(tools))
+        prep.initial['registry'] = p.sha(self.registry)
+        portal = prep.root / 'portail.next'
+        portal.mkdir()
+        repo = SCRIPTS.parent
+        shutil.copytree(repo / 'src', portal / 'src')
+        (portal / 'scripts').mkdir()
+        shutil.copyfile(repo / 'scripts/prepare-caddy.ts', portal / 'scripts/prepare-caddy.ts')
+        (portal / 'package.json').write_text('{"type":"module"}')
+        (portal / 'node_modules').mkdir()
+        (portal / 'node_modules/tsx').symlink_to(Path(os.environ['TSX_FIXTURE_PACKAGE']).resolve())
+        binary = prep.root / 'runtime/node/bin'
+        binary.mkdir(parents=True)
+        (binary / 'node').symlink_to(Path(shutil.which('node')).resolve())
+        before = p.sha(self.registry)
+        prep.candidates()
+        candidate = (prep.root / 'candidates/Caddyfile.proposed').read_text()
+        for route in p.ROUTES:
+            self.assertIn('handle_path ' + route + '/*', candidate)
+        self.assertLess(candidate.index('basic_auth'), candidate.index('handle_path'))
+        self.assertIn('admin off', candidate)
+        self.assertEqual(before, p.sha(self.registry))
+        (prep.root / 'candidates/Caddyfile.proposed').write_text('foreign configuration')
+        with self.assertRaisesRegex(p.Stop, 'CANDIDATE_CHANGED'):
+            prep.candidates()
+
+    @unittest.skipUnless(os.environ.get('AMAZONIA_FIXTURE_ROOT') and os.environ.get('TSX_FIXTURE_PACKAGE'), 'real Amazonia/tsx fixtures not configured')
+    def test_real_restore_backup_restore_and_retry_after_interruption(self):
+        prep = self.opened()
+        code = Path(os.environ['AMAZONIA_FIXTURE_ROOT']).resolve()
+        head = subprocess.check_output(['git', '-C', str(code), 'rev-parse', 'HEAD'], text=True).strip()
+        self.assertEqual(head, p.AMAZONIA)
+        shutil.copytree(code, prep.root / 'amazonia.next', symlinks=True, ignore=shutil.ignore_patterns('.git', 'node_modules'))
+        modules = prep.root / 'amazonia.next/node_modules'
+        modules.mkdir()
+        (modules / 'tsx').symlink_to(Path(os.environ['TSX_FIXTURE_PACKAGE']).resolve(), target_is_directory=True)
+        node = Path(shutil.which('node')).resolve()
+        binary = prep.root / 'runtime/node/bin'
+        binary.mkdir(parents=True)
+        (binary / 'node').symlink_to(node)
+        # A genuinely interrupted attempt is kept; next generation is used.
+        (prep.root / 'restore-0').mkdir()
+        (prep.root / 'restore-0/partial').write_text('interrupted')
+        prep.restore()
+        record = json.loads((prep.root / 'restoration.json').read_text())
+        self.assertEqual(record['directory'], 'restore-1')
+        self.assertEqual(record['compatible_records'], 2)
+        self.assertTrue(record['roundtrip'])
+        self.assertTrue((prep.root / 'restore-1/sqlite-restored/orchestration.sqlite').is_file())
+        self.assertEqual(snapshot(self.history), self.initial_history)
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        self.assertEqual((prep.root / 'restore-0/partial').read_text(), 'interrupted')
+        # Loading failure creates no false success marker.
+        (prep.root / 'restoration.json').rename(prep.root / 'restoration.previous.json')
+        with patch.object(p.subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixture', 1)):
+            with self.assertRaisesRegex(p.Stop, 'HISTORY_LOAD_FAILED'):
+                prep.restore()
+        self.assertFalse((prep.root / 'restoration.json').exists())
+
+
+def stat_mode(path):
+    return path.stat().st_mode & 0o777
+
+
+if __name__ == '__main__':
+    unittest.main()
