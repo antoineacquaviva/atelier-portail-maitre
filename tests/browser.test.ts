@@ -165,7 +165,7 @@ test(
         includeCalibrationTables: false,
       };
       const status = await page.evaluate(
-        async (body) =>
+        async (body: unknown) =>
           (
             await fetch("/amazonia/api/campaigns", {
               method: "POST",
