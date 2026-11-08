@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-from oracle_prepare import Stop, need, canonical, sha, extract_node, verify_node, publish_node
+from oracle_prepare import Stop, need, canonical, sha, extract_node, verify_node, publish_node, safe_env, SYSTEM_PATH
 
 
 def account(name):
@@ -22,7 +22,7 @@ def account(name):
     except KeyError:
         subprocess.run(['/usr/sbin/useradd', '--system', '--user-group', '--no-create-home',
                         '--shell', '/sbin/nologin', name], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=safe_env())
         p = pwd.getpwnam(name)
     need(0 < p.pw_uid < 1000 and p.pw_shell == '/sbin/nologin', 'EXISTING_ACCOUNT_REVIEW')
     group = grp.getgrgid(p.pw_gid)
@@ -114,7 +114,7 @@ def main():
             subprocess.run(['/usr/sbin/runuser', '-u', owner.pw_name, '--', str(dest / 'bin/node'),
                             '-e', 'require("node:sqlite")'], check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           env={'PATH': '/usr/bin:/bin'})
+                           env={'PATH': SYSTEM_PATH})
         print('Comptes/dossiers dédiés et Node parallèle vérifiés. Aucun service modifié.')
         return 0
     except Exception as e:

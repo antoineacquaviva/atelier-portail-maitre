@@ -373,6 +373,14 @@ class Fixtures(unittest.TestCase):
             prep.run()
             self.assertTrue(json.loads((prep.root / 'report.json').read_text())['success'])
             prep.run()
+            # No privileged command is executed: check the real launch boundary.
+            with patch.dict(os.environ, {'PATH': '/untrusted-user-path'}), \
+                 patch.object(p.subprocess, 'run') as launch:
+                launch.return_value.returncode = 0
+                prep.run(provision=True)
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.args[0][0:2], ['sudo', '/usr/bin/python3'])
+            self.assertEqual(launch.call_args.kwargs['env']['PATH'], p.SYSTEM_PATH)
         self.assertEqual(calls.count('node'), 1)
         self.assertEqual(calls.count('amazonia.next'), 1)
         self.assertEqual(calls.count('portail.next'), 2)
