@@ -302,17 +302,19 @@ Sans sudo portail, les opérations privilégiées de l'interface resteront indis
 
 **Aucun secret ou hash réel n'est fourni ni généré par cette PR.** Les commandes suivantes ne seront exécutées que par le propriétaire dans son terminal privé, après P. Ne pas utiliser de mot de passe en argument, variable exportée, URL, screenshot ou journal. Ne pas sourcer un EnvironmentFile systemd dans Bash (le hash contient des `$`, les grammaires diffèrent).
 
-**Objectif :** créer les répertoires privés normalisés par ce plan. **Effets :** nouvelles cibles seulement, pas de remplacement aveugle. **Attendu :** parents 0700 pour chaque backend. **Arrêt :** dossier/fichier déjà existant non audité. `/etc/amazonia/service.env` est requis par la recette du code ; les autres chemins ci-dessous sont des **cibles nouvelles proposées**, pas des constats.
+**Erratum de revue 1C.3 :** les parents de configuration doivent appartenir à root, jamais aux comptes applicatifs, pour que ceux-ci ne puissent pas remplacer/supprimer `service.env`. Voir [la structure de permissions 1C.3](PREPARATION_ORACLE_1C3.md). Les anciens dossiers applicatifs en 0700 sont incompatibles : s'arrêter pour revue/migration manuelle distincte, aucune réparation automatique.
+
+**Objectif :** créer les répertoires privés normalisés par ce plan. **Effets :** nouvelles cibles seulement, pas de remplacement aveugle. **Attendu :** parents root:groupe privé du service, 0750 ; aucun autre compte membre de ce groupe. **Arrêt :** dossier/fichier déjà existant non audité. `/etc/amazonia/service.env` est requis par la recette du code ; les autres chemins ci-dessous sont des **cibles nouvelles proposées**, pas des constats.
 
 ```bash
-sudo install -d -o amazonia -g amazonia -m 700 /etc/amazonia
-sudo install -d -o "$PORTAL_USER" -g "$PORTAL_USER" -m 700 /etc/atelier-portail
+sudo install -d -o root -g amazonia -m 750 /etc/amazonia
+sudo install -d -o root -g "$PORTAL_USER" -m 750 /etc/atelier-portail
 /usr/bin/caddy hash-password
 ```
 
 Saisir un mot de passe fort à l'invite interactive ; copier le hash uniquement dans l'éditeur privé ci-dessous, jamais dans le rapport. Choisir un identifiant Basic unique (non secret) et conserver le mot de passe dans le gestionnaire privé du propriétaire.
 
-**Objectif :** créer une clé interne unique et ses deux copies sans affichage. **Effets :** trois fichiers nouveaux 0600 ; une clé hexadécimale de 32 octets. **Attendu :** fichiers égaux accessibles aux seuls comptes concernés. **Arrêt :** cible déjà existante, erreur de copie ou comparaison ; aucune rotation partielle.
+**Objectif :** créer une clé interne unique et ses deux copies sans affichage. **Effets :** deux clés nouvelles en 0400 possédées par leurs services et un EnvironmentFile Caddy root:root 0600 ; une clé hexadécimale de 32 octets. **Attendu :** fichiers égaux accessibles aux seuls comptes concernés ; les parents restent contrôlés par root, `service.env` root:root 0600 n'est lisible/modifiable que par l'administrateur/systemd. **Arrêt :** cible déjà existante, erreur de copie ou comparaison ; aucune rotation partielle. Ces commandes restent futures : aucun secret réel n'a été créé par la correction 1C.3.
 
 ```bash
 sudo python3 - "$PORTAL_USER" <<'PY'
@@ -322,7 +324,7 @@ paths=['/etc/amazonia/internal-key','/etc/atelier-portail/internal-key','/etc/ca
 assert all(not os.path.lexists(x) for x in paths)
 key=secrets.token_hex(32)
 for path,uid,gid,content in [(paths[0],a.pw_uid,a.pw_gid,key+'\n'),(paths[1],p.pw_uid,p.pw_gid,key+'\n'),(paths[2],0,0,'ATELIER_INTERNAL_KEY='+key+'\n')]:
-    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600 if uid==0 else 0o400)
     with os.fdopen(fd,'w') as f: f.write(content)
     os.chown(path,uid,gid)
 PY
