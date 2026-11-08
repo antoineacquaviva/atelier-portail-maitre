@@ -399,24 +399,68 @@ PY
 
 **Objectif :** prouver la restauration de la sauvegarde existante sans toucher à ses octets ni lancer l'ancien chargeur. **Effets :** nouvelle copie sous STAGE, création SQLite/quarantaine uniquement dans cette copie. Aucun port ouvert, aucune campagne créée/reprise, aucun service démarré. **Attendu :** 16 fichiers et hashes d'origine préservés, deux vides recensés, campagnes attendues retrouvées avec ID/état/compteurs ; toute différence est expliquée. **Arrêt :** chemin ou compte différent, lien, SQLite source inattendue, copie incomplète, changement d'historique ou campagne manquante. L'accord P autorise cet essai sur copie, pas sur la production.
 
+Le dossier de sauvegarde contient lui-même `data`. La copie complète doit donc donner `restore-json/data/campaigns`, **jamais** `restore-json/campaigns`. Le constructeur CampaignManager peut créer un répertoire manquant : ne jamais l'utiliser pour détecter la bonne racine. Les contrôles suivants doivent réussir **avant** son appel. Les effectifs 16/11/2 sont ceux du bilan initial ; toute variation arrête le parcours pour nouvel inventaire et revue, sans ignorer ou réparer les fichiers.
+
+<!-- 1c2:p12-copy -->
 ```bash
 test ! -e "$STAGE/restore-json"
+test ! -L "$STAGE/restore-json"
+test -d /home/opc/amazonia-data-backup-20261108-125739/data/campaigns
 cp -a /home/opc/amazonia-data-backup-20261108-125739 "$STAGE/restore-json"
-python3 - /home/opc/amazonia-data-backup-20261108-125739 "$STAGE/restore-json" <<'PY'
-import pathlib,sys,hashlib
+SOURCE_DATA=/home/opc/amazonia-data-backup-20261108-125739/data
+RESTORE_DATA="$STAGE/restore-json/data"
+RESTORE_CAMPAIGNS="$RESTORE_DATA/campaigns"
+```
+
+**Objectif :** comparer l'arborescence `data` entière avant initialisation. **Effets :** lectures seulement. **Attendu :** 16 JSON à leurs chemins relatifs, 11 directement dans campaigns, deux vides et aucune SQLite préalable. **Arrêt :** racine absente, non canonique, symbolique, identique/imbriquée avec la source, dossier inattendu ou différence. Cette vérification est aussi celle de B02 avant chargement de sa copie finale ; y reprendre les variables définies à B02, sans refaire la copie P12.
+
+<!-- 1c2:verify-json-copy -->
+```bash
+python3 - "$SOURCE_DATA" "$RESTORE_DATA" "$STAGE" <<'PY'
+import pathlib,sys,hashlib,stat
+src,dst,stage=map(pathlib.Path,sys.argv[1:])
+for p in (src,dst,stage):
+    assert p.is_absolute() and p.resolve()==p and p.is_dir() and not p.is_symlink(), 'Racine invalide'
+assert dst.is_relative_to(stage) and dst!=stage, 'Copie hors staging'
+assert src!=dst and not src.is_relative_to(dst) and not dst.is_relative_to(src), 'Source et copie non isolées'
+assert dst.name=='data' and (dst/'campaigns').is_dir(), 'Arborescence data/campaigns requise'
 def inv(root):
     d={}
-    for p in pathlib.Path(root).rglob('*'):
+    for p in root.rglob('*'):
         assert not p.is_symlink(), 'Lien interdit'
+        assert p.is_dir() or stat.S_ISREG(p.stat().st_mode), 'Type de fichier inattendu'
         if p.is_file(): d[str(p.relative_to(root))]=(p.stat().st_size,hashlib.sha256(p.read_bytes()).hexdigest())
     return d
-a,b=map(inv,sys.argv[1:]); assert a==b, 'Copie différente'
-print('Fichiers:',len(a),'JSON:',sum(p.endswith('.json') for p in a),'vides:',sum(s==0 for s,h in a.values()))
+a,b=inv(src),inv(dst)
+assert a==b, 'Copie différente'
+assert len(a)==16 and all(p.endswith('.json') for p in a), 'Inventaire initial inattendu'
+assert sum(pathlib.PurePosixPath(p).parent==pathlib.PurePosixPath('campaigns') for p in a)==11, 'Racine campaigns incorrecte'
+assert sum(size==0 for size,h in a.values())==2, 'Fichiers vides inattendus'
+assert not (dst/'data').exists() and not (dst/'campaigns'/'campaigns').exists(), 'Double niveau inattendu'
+print('Copie vérifiée : 16 JSON, 11 campagnes, deux fichiers vides')
 PY
+```
+
+**Objectif :** lire uniquement la copie validée. **Effets :** création SQLite/quarantaine dans RESTORE_CAMPAIGNS seulement. **Attendu :** rapport de campagnes compatibles ; aucune création/reprise de campagne. **Arrêt :** contrôle de chemin/état refusé ou campagne attendue manquante. L'argument `json` signifie une copie complète sous `data/campaigns` ; `sqlite` signifie la destination directe de l'outil restore, contenant déjà `orchestration.sqlite`. Toujours utiliser un chemin **existant sous STAGE**, jamais la source ni le stockage de production.
+
+<!-- 1c2:load-restored -->
+```bash
 cd "$STAGE/amazonia.next"
-AMAZONIA_WORKERS=2 AMAZONIA_CAMPAIGNS=1 AMAZONIA_BATCH_SIZE=5 "$NODE_BIN" --import tsx --input-type=module - "$STAGE/restore-json/campaigns" > "$STAGE/reports/restored-campaigns.private.json" 2> "$STAGE/reports/restored-loader.private.log" <<'JS'
+AMAZONIA_WORKERS=2 AMAZONIA_CAMPAIGNS=1 AMAZONIA_BATCH_SIZE=5 "$NODE_BIN" --import tsx --input-type=module - "$RESTORE_CAMPAIGNS" "$STAGE" json > "$STAGE/reports/restored-campaigns.private.json" 2> "$STAGE/reports/restored-loader.private.log" <<'JS'
+import fs from 'node:fs';
+import path from 'node:path';
+import assert from 'node:assert/strict';
 import {CampaignManager} from './src/server/campaignManager.ts';
-const m=new CampaignManager({campaignsDir:process.argv[2]});
+const [root,stage,kind]=process.argv.slice(2);
+assert(['json','sqlite'].includes(kind), 'Type de restauration inconnu');
+for (const p of [root,stage]) assert(path.isAbsolute(p) && fs.realpathSync(p)===p && fs.statSync(p).isDirectory(), 'Racine existante canonique requise');
+assert(root.startsWith(stage+path.sep), 'Gestionnaire limité à la copie sous STAGE');
+if(kind==='json') assert(path.basename(root)==='campaigns' && path.basename(path.dirname(root))==='data', 'Racine data/campaigns requise');
+if(kind==='sqlite') assert(fs.lstatSync(path.join(root,'orchestration.sqlite')).isFile() && !fs.lstatSync(path.join(root,'orchestration.sqlite')).isSymbolicLink(), 'SQLite restaurée requise');
+assert(!fs.existsSync(path.join(root,'data')) && !fs.existsSync(path.join(root,'campaigns')), 'Niveau de campagnes inattendu');
+for(const item of fs.readdirSync(root,{withFileTypes:true})) assert(!item.isSymbolicLink(), 'Lien interdit');
+assert(fs.readdirSync(root).filter(n=>n.endsWith('.json')).length===11, 'Onze historiques JSON attendus');
+const m=new CampaignManager({campaignsDir:root});
 try { console.log(JSON.stringify(m.listCampaigns().map(c=>({id:c.id,status:c.status,progress:c.progress})),null,2)); }
 finally {await m.close();}
 JS
@@ -426,13 +470,14 @@ Comparer la copie des 16 fichiers à nouveau avec le même inventaire Python, en
 
 **Objectif :** sauvegarder et restaurer la SQLite nouvellement créée dans la copie. **Effets :** deux nouveaux répertoires de recette seulement. **Attendu :** manifeste et integrity_check valides, seconde restauration lisible, mêmes états/compteurs. **Arrêt :** erreur, archive partielle, bail/WAL/SHM inattendu ; ne rien effacer pour faire réussir l'outil.
 
+<!-- 1c2:sqlite-roundtrip -->
 ```bash
 cd "$STAGE/amazonia.next"
-"$NODE_BIN" --import tsx scripts/backup.ts backup "$STAGE/restore-json/campaigns" "$STAGE/sqlite-test-backup"
+"$NODE_BIN" --import tsx scripts/backup.ts backup "$RESTORE_CAMPAIGNS" "$STAGE/sqlite-test-backup"
 "$NODE_BIN" --import tsx scripts/backup.ts restore "$STAGE/sqlite-test-backup" "$STAGE/sqlite-test-restored"
 ```
 
-Relancer le bloc CampaignManager sur `sqlite-test-restored` (nouveau rapport distinct), jamais sur l'archive, et comparer. Le script intègre les empreintes et `integrity_check`, normalise uniquement l'archive, retire uniquement son bail et finalise son journal ; aucun `rm *-wal`, `rm *-shm` ou suppression manuelle du bail. Pour une future SQLite active, utiliser ce script avec WAL via l'API backup, pas `cp` du seul fichier. Il n'archive que la racine campagnes/quarantaine/JSON concernés : les cinq JSON hors campaigns et autres données restent dans la sauvegarde complète DATA_NEW séparée.
+L'outil SQLite restaure **le contenu de campaigns directement** dans `sqlite-test-restored` : sa racine est `$STAGE/sqlite-test-restored`, sans ajouter `/data/campaigns`. Relancer le bloc `1c2:load-restored` avec `RESTORE_CAMPAIGNS="$STAGE/sqlite-test-restored"`, l'argument `sqlite` à la place de `json`, et deux nouveaux fichiers de rapport (ne pas écraser les premiers), puis comparer les ID/états/compteurs. Jamais de gestionnaire sur l'archive. Le script intègre les empreintes et `integrity_check`, normalise uniquement l'archive, retire uniquement son bail et finalise son journal ; aucun `rm *-wal`, `rm *-shm` ou suppression manuelle du bail. Pour une future SQLite active, utiliser ce script avec WAL via l'API backup, pas `cp` du seul fichier. Il n'archive que la racine campagnes/quarantaine/JSON concernés : les cinq JSON hors campaigns et autres données restent dans la sauvegarde complète DATA_NEW séparée.
 
 ### P13 — compatibilité réelle des voisins, avant de choisir le Caddyfile final
 
@@ -575,7 +620,22 @@ sha256sum -c "$STAGE/reports/final.sha256"
 cmp "$STAGE/registry.before.json" "$STAGE/registry.final.json"
 ```
 
-Toute différence de registre impose une nouvelle validation P09/P14 et revue, pas un écrasement avec la copie périmée. Inclure aussi dans config.final.tar les fichiers externes identifiés P02/P05. Copier l'état final hors VM et vérifier les hashes avant remplacement. Extraire data.final.tar dans un **nouveau répertoire de restauration isolé**, répéter P12 puis décider si tous les historiques attendus sont disponibles. Ces opérations prolongent l'indisponibilité : réserver cette durée dans B.
+Toute différence de registre impose une nouvelle validation P09/P14 et revue, pas un écrasement avec la copie périmée. Inclure aussi dans config.final.tar les fichiers externes identifiés P02/P05. Copier l'état final hors VM et vérifier les hashes avant remplacement.
+
+**Objectif :** restaurer l'archive froide pour recette isolée. **Effets :** nouvelle copie sous STAGE seulement. **Attendu :** `restore-final/data/campaigns`, car B02 archive le membre relatif `data` avec `-C /srv/jeu/amazonia data`. **Arrêt :** cible déjà existante/liée, archive dont les membres ne sont pas ceux attendus sous `data/`, ou erreur d'extraction ; ne pas l'aplatir. Examiner `tar -tf` avant extraction (aucun chemin absolu/`..`, lien ou fichier spécial). Les archives viennent de la source inventoriée sans liens, pas d'un tiers.
+
+<!-- 1c2:b02-extract -->
+```bash
+test ! -e "$STAGE/restore-final"
+test ! -L "$STAGE/restore-final"
+mkdir -m 700 "$STAGE/restore-final"
+sudo tar --acls --xattrs --selinux --numeric-owner -xpf "$STAGE/data.final.tar" -C "$STAGE/restore-final"
+SOURCE_DATA=/srv/jeu/amazonia/data
+RESTORE_DATA="$STAGE/restore-final/data"
+RESTORE_CAMPAIGNS="$RESTORE_DATA/campaigns"
+```
+
+Rejouer ensuite les seuls blocs P12 `1c2:verify-json-copy` et `1c2:load-restored` avec **ces variables**, en choisissant des noms de rapports nouveaux. Ne pas rejouer la copie de la vieille sauvegarde P12, qui ne testerait pas l'archive finale. Si les propriétaires restaurés nécessitent des droits pour lire la copie, faire ajuster les permissions de cette seule copie par l'opérateur ; ne jamais modifier la source pour cet essai. Décider ensuite si tous les historiques attendus sont disponibles. Ces opérations prolongent l'indisponibilité : réserver cette durée dans B.
 
 ### B03 — copier tout data dans le stockage dédié, sans aplatir campaigns
 
@@ -587,8 +647,34 @@ sudo find "$DATA_NEW" -mindepth 1 -print
 
 À ce stade seul le répertoire `campaigns` vide créé en P10 doit apparaître. Après vérification visuelle de ce point :
 
+**Objectif :** refuser une mauvaise racine ou une destination déjà utilisée avant copie. **Effets :** lectures seulement. **Attendu :** source canonique avec campaigns et 16 fichiers JSON, destination canonique distincte contenant seulement campaigns vide. **Arrêt :** toute assertion échoue, y compris lien cassé, destination non vide ou confusion data/campaigns ; aucun fichier n'est copié.
+
+<!-- 1c2:b03-preflight -->
+```bash
+sudo python3 - /srv/jeu/amazonia/data "$DATA_NEW" "$CAMPAIGNS_NEW" <<'PY'
+import pathlib,sys,stat
+src,dst,campaigns=map(pathlib.Path,sys.argv[1:])
+for p in (src,dst,campaigns):
+    assert p.is_absolute() and p.resolve()==p and p.is_dir() and not p.is_symlink(), 'Racine invalide'
+assert src!=dst and not src.is_relative_to(dst) and not dst.is_relative_to(src), 'Racines non isolées'
+assert campaigns==dst/'campaigns' and (src/'campaigns').is_dir(), 'Racine campaigns incorrecte'
+assert list(dst.iterdir())==[campaigns] and not list(campaigns.iterdir()), 'Destination non vide inattendue'
+files=[]
+for p in src.rglob('*'):
+    assert not p.is_symlink(), 'Lien source interdit'
+    assert p.is_dir() or stat.S_ISREG(p.stat().st_mode), 'Type source inattendu'
+    if p.is_file(): files.append(p)
+assert len(files)==16 and all(p.suffix=='.json' for p in files), 'Inventaire source inattendu'
+assert sum(p.parent==src/'campaigns' for p in files)==11, 'Onze JSON campagnes attendus'
+assert sum(p.stat().st_size==0 for p in files)==2, 'Deux fichiers vides attendus'
+assert not (src/'data').exists() and not (src/'campaigns'/'campaigns').exists(), 'Double niveau inattendu'
+print('Migration prête : racines distinctes, 16 JSON, destination vide')
+PY
+```
+
 **Objectif :** copier sans suivre de liens ni omettre de fichier caché. **Effets :** copie des données froides ; droits resserrés sur cette seule arborescence nouvelle. **Attendu :** aucune différence de contenu et accès du compte amazonia. **Arrêt :** chemin DATA_NEW non canonique/hors checkout, erreur de copie ou hash différent. Aucun chown/chmod des parents partagés ni des voisins.
 
+<!-- 1c2:b03-copy -->
 ```bash
 sudo cp -a --no-dereference /srv/jeu/amazonia/data/. "$DATA_NEW/"
 sudo find "$DATA_NEW" -type d -exec chown amazonia:amazonia {} +
@@ -621,6 +707,8 @@ PY
 ```
 
 Les onze JSON campagnes vont dans DATA_NEW/campaigns, pas DATA_NEW/campaigns/campaigns. Les autres JSON restent dans DATA_NEW à leurs chemins relatifs. Le nouveau gestionnaire crée SQLite dans CAMPAIGNS_NEW et lit les historiques à ce même niveau ; aucune conversion massive ni réparation des vides.
+
+Ne pas exécuter le bloc de lecture de recette P12 sur DATA_NEW/CAMPAIGNS_NEW : c'est le futur stockage de production. Sa lecture réelle commence uniquement lors de B05 après les contrôles et accords prévus. Les essais du gestionnaire se font sur `restore-json/data/campaigns`, `restore-final/data/campaigns` ou une nouvelle restauration isolée, jamais sur les originaux.
 
 ### B04 — placer les releases sans réécrire les anciennes
 
@@ -726,7 +814,7 @@ Lire les rapports JSON en privé et comparer ID, états COMPLETED et compteurs a
 
 ## 6. Accord R — petite campagne persistante et recette complète
 
-Le propriétaire autorise maintenant une campagne **nouvelle et seule** de recette ; ne jamais reprendre ni supprimer une campagne historique. Prendre une sauvegarde SQLite avec scripts/backup.ts et une archive complète DATA_NEW avant l'essai ; destinations nouvelles et copie hors VM vérifiée, commandes identiques à P12 avec la racine canonique de production. Le compte effectif doit avoir accès à la destination sans donner au portail les données Amazonia.
+Le propriétaire autorise maintenant une campagne **nouvelle et seule** de recette ; ne jamais reprendre ni supprimer une campagne historique. Prendre une sauvegarde SQLite avec scripts/backup.ts et une archive complète DATA_NEW avant l'essai ; destinations nouvelles et copie hors VM vérifiée. Réutiliser **seulement les commandes backup/restore** P12 : la source du backup est alors CAMPAIGNS_NEW, mais la destination restore est un répertoire nouveau sous STAGE, directement racine de campagnes. Le gestionnaire de recette ne reçoit jamais CAMPAIGNS_NEW : il reçoit cette nouvelle copie restaurée, avec l'argument `sqlite` et de nouveaux rapports. Ne pas rejouer la vérification « 16 JSON avant initialisation » sur une racine qui contient désormais SQLite. Le compte effectif doit avoir accès à la destination sans donner au portail les données Amazonia.
 
 ### R01 — préparer une configuration de dix parties sans lancer le calcul
 
@@ -788,7 +876,7 @@ sudo du -sh "$DATA_NEW"
 systemctl show amazonia.service --property=MemoryCurrent,CPUUsageNSec,TasksCurrent
 ```
 
-Comparer total planifié/exécuté, génération/checkpoints et résultats/export. Vérifier CPU/RAM/disque/WAL durant la recette ; garder assez de marge pour sauvegarde et rollback, sans swap/OOM ni saturation des voisins. Si limite atteinte, suspendre la recette via sa commande autorisée, pas une campagne historique. Prouver aussi une **nouvelle restauration isolée de la sauvegarde contenant cette recette**, lecture même ID/compteurs avec la release exacte et aucune reprise automatique ; utiliser P12, sans pointer le gestionnaire sur l'archive ni le stockage actif.
+Comparer total planifié/exécuté, génération/checkpoints et résultats/export. Vérifier CPU/RAM/disque/WAL durant la recette ; garder assez de marge pour sauvegarde et rollback, sans swap/OOM ni saturation des voisins. Si limite atteinte, suspendre la recette via sa commande autorisée, pas une campagne historique. Prouver aussi une **nouvelle restauration SQLite isolée de la sauvegarde contenant cette recette**, lecture même ID/compteurs avec la release exacte et aucune reprise automatique ; utiliser les commandes backup/restore P12 puis le gestionnaire en mode `sqlite` sur la destination directe restaurée sous STAGE, sans pointer le gestionnaire sur l'archive ni le stockage actif. La sauvegarde complète séparée conserve les fichiers hors campaigns ; ne pas prétendre que l'archive SQLite seule restaure les 16 JSON dans leur arborescence data.
 
 ### R05 — rejouer la matrice des voisins et accepter
 
@@ -850,6 +938,8 @@ sudo tar --acls --xattrs --selinux --numeric-owner -xpf "$STAGE/code.final.tar" 
 sudo tar --acls --xattrs --selinux --numeric-owner -xpf "$STAGE/data.final.tar" -C "$STAGE/rollback-json"
 ```
 
+Cette extraction donne **`$STAGE/rollback-json/data/campaigns`**, pas `rollback-json/campaigns`. Pour lire cette seule copie avec la release ciblée : `SOURCE_DATA` désigne la source froide inventoriée, `RESTORE_DATA="$STAGE/rollback-json/data"` et `RESTORE_CAMPAIGNS="$RESTORE_DATA/campaigns"`. Rejouer la vérification JSON P12 avant le gestionnaire et créer de nouveaux rapports. Ce parcours s'applique à l'archive JSON initiale ; une archive postérieure contenant SQLite ne doit pas être présentée comme une archive JSON de 16 fichiers. Suivre alors la restauration SQLite ci-dessous.
+
 Pour restaurer une sauvegarde SQLite compatible, employer la release/Node exacts de son manifeste : `scripts/backup.ts restore` avec chemin archive identifié et **nouvelle destination inexistante** ; même commande P12, pas d'invention de nom de sauvegarde ni restauration sur CAMPAIGNS_NEW. Affecter seulement les fichiers restaurés au compte dédié et vérifier sur copie les ID/compteurs, schéma/provenance, absence de reprise automatique. Conserver les campagnes plus récentes dans `failed-sqlite-backup` / `failed-data.tar`, séparées, sans fusion de bases.
 
 Pour revenir aux anciens répertoires de code aux cwd initiaux, **après archives RB02 et seulement si aucun service ne tourne**, retirer les nouvelles releases par renommage vers des destinations nouvelles approuvées dans STAGE, puis déplacer les dossiers `retired/amazonia` et `retired/atelier-portail-maitre` à leurs cwd d'origine. Ne pas les démarrer ; les originaux et données anciennes restent ainsi disponibles pour expertise. Une exécution de l'ancien code, si elle devient nécessaire, utilisera un clone de ces données dans un contexte isolé revu, jamais leur seule copie.
@@ -882,6 +972,24 @@ Ne pas extraire config.final.tar sur `/` : restaurer explicitement les seuls fic
 
 ## 9. Validation de cette livraison documentaire
 
-Seul ce document est ajouté au dépôt portail sur branche dédiée. Aucun code applicatif, moteur, bot, dépendance, registre, donnée ou secret n'est modifié. Les commandes du plan sont relues contre les sources fixées : **39 blocs Bash analysés avec `bash -n`, six blocs Python compilés sans exécution et trois blocs JavaScript analysés avec `node --check --input-type=module`**, tous réussis. `git diff --cached --check` et contrôle du lien relatif local réussis. Aucune commande opératoire exécutée, aucun appel SSH ou HTTP vers Oracle, aucun service démarré ou arrêté, aucune installation Node, aucune génération de secret réel. Les suites applicatives ne sont pas relancées pour cet ajout Markdown. Les résultats antérieurs 1B.5 ne sont pas présentés comme une recette Oracle ni comme des tests réexécutés pour cette PR.
+Cette PR ajoute ce document et son [test documentaire sur fixtures](../tests/documentation/oracle_restore_1c2.py). Aucun code applicatif, moteur, bot, dépendance du projet, registre, donnée réelle ou secret n'est modifié. Aucun appel SSH ou HTTP vers Oracle, aucune gestion de service, aucune installation Node et aucune génération de secret réel. Les contrôles de syntaxe sont distincts de l'essai fonctionnel ci-dessous. Les résultats antérieurs 1B.5 ne sont pas présentés comme une recette Oracle ni comme des tests réexécutés pour cette PR.
+
+### Correction après revue — parcours de restauration réellement exercé sur fixtures
+
+P12 lit désormais `restore-json/data/campaigns`, B02 `restore-final/data/campaigns`, B03 copie le **contenu** de data vers DATA_NEW (`data/.`, aucun niveau data supplémentaire) et RB03 lit `rollback-json/data/campaigns`. Une restauration par `scripts/backup.ts restore` donne directement la racine campagnes, sans ajouter data/campaigns. Les réutilisations de P12 après initialisation utilisent cette branche SQLite et ne relancent pas le contrôle de copie JSON vierge.
+
+Commande effectivement exécutée **dans Codex uniquement**, avec des dépendances de test isolées sous `/tmp` (tsx 4.21.0, aucun changement des dépendances des dépôts) et Node 24.22.1 déjà présent :
+
+```bash
+python3 tests/documentation/oracle_restore_1c2.py --amazonia-root /workspace/Amazonia --tsx-loader /tmp/amazonia-1c2-doc-test-deps/node_modules/tsx/dist/loader.mjs
+```
+
+Le test exige le checkout Amazonia propre au commit `efdb787ad3edad845dfc60c6124f6bca2cd4dd6e` et extrait les blocs marqués de ce document, afin de contrôler les commandes écrites et leurs arguments. Il remplace les seuls chemins Oracle par les racines temporaires, le chargeur tsx par son chemin local, les rapports de seconde lecture par de nouveaux noms, et retire sudo des seules opérations de fichiers testées. Le lecteur du gestionnaire utilise un worker configuré au lieu de deux sur cet hôte de test à deux CPU disponibles ; il ne lance ni calcul, ni serveur HTTP, ni service. Les changements de propriétaire, SELinux, unités, comptes, secrets et règles réseau ne sont pas exécutés ni validés par cet essai.
+
+**Résultats : neuf groupes de validation fonctionnelle réussis.** Copie `cp -a`, archive `tar -C parent data`, extraction et copie `data/.` réellement exécutées sur 16 JSON fictifs : onze dans campaigns, cinq hors campaigns, dont deux fichiers vides préservés. Deux historiques compatibles COMPLETED sont réellement lus par CampaignManager avec compteurs 10/20 ; sept JSON incompatibles fictifs sont conservés avec quarantaine. L'outil Amazonia réel crée une sauvegarde SQLite, valide intégrité/manifeste et restaure une nouvelle destination ; celle-ci retrouve les mêmes ID/états/compteurs. La lecture de la copie ne change pas l'archive.
+
+Les refus sont exercés pour racine absente, confusion data/campaigns, racine source originale, chemin symbolique, fichier supplémentaire, JSON vide altéré, destination de migration non vide, racines source/destination identiques, réextraction et restauration sur cible existante, et empreinte d'archive falsifiée. L'instantané des sources fictives (contenu, arborescence, tailles, modes, UID/GID et mtime, hors atime) est identique avant/après. Les originaux ne sont jamais ouverts par CampaignManager. Le checkout Amazonia reste inchangé.
+
+Limite : la SQLite de cet essai contient le schéma d'orchestration réel ; les campagnes historiques demeurent dans leurs JSON comme le prévoit cette version. L'essai ne crée pas de campagne durable, ne simule pas une charge worker ni un WAL actif, et ne remplace ni la restauration des données réelles après accord P ni la recette R sur Oracle. Les suites applicatives complètes ne sont pas relancées pour cette correction documentaire. Analyse syntaxique des blocs Bash/Python/JavaScript et `git diff --cached --check` également réussis ; ces contrôles ne sont pas la preuve fonctionnelle.
 
 Limites bloquantes conservées : Caddy effectif complet, registre, règles OCI/IPv6, BGA et authentification des voisins, version Node choisie/disponible, permissions/SELinux, restauration et cohérence réelle des copies. Le plan peut être revu maintenant ; **il n'est pas un feu vert d'exécution tant que ces éléments et les accords P/B/R ne sont pas acquis**. La mission 1C.2 se termine à la PR du plan, non fusionnée.
