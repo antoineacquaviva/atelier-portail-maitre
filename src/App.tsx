@@ -107,7 +107,7 @@ export default function App() {
   const handlePortalSelfUpdate = async () => {
     setUpdatingPortal(true);
     try {
-      const res = await fetch('/api/portal/self-update', { method: 'POST' });
+      const res = await fetch('/api/portal/self-update', { method: 'POST', headers: {'Content-Type':'application/json'}, body:'{}' });
       const data = await res.json();
       if (data.error) {
         showToast(`Erreur MAJ Portail : ${data.error}`);
