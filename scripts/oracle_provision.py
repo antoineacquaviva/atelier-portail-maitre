@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 sys.dont_write_bytecode = True
-from oracle_prepare import Stop, need, canonical, sha, extract_node
+from oracle_prepare import Stop, need, canonical, sha, extract_node, verify_node, publish_node
 
 
 def account(name):
@@ -25,7 +25,9 @@ def account(name):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         p = pwd.getpwnam(name)
     need(0 < p.pw_uid < 1000 and p.pw_shell == '/sbin/nologin', 'EXISTING_ACCOUNT_REVIEW')
-    need(grp.getgrgid(p.pw_gid).gr_name == name, 'ACCOUNT_GROUP')
+    group = grp.getgrgid(p.pw_gid)
+    need(group.gr_name == name and set(group.gr_mem) <= {name}, 'ACCOUNT_GROUP')
+    need(not [other for other in pwd.getpwall() if other.pw_gid == p.pw_gid and other.pw_uid != p.pw_uid], 'ACCOUNT_SHARED_GROUP')
     need(not [g for g in grp.getgrall() if name in g.gr_mem and g.gr_gid != p.pw_gid], 'ACCOUNT_EXTRA_GROUPS')
     return p
 
@@ -39,6 +41,44 @@ def dedicated(path, user):
     s = p.stat()
     need(p.is_dir() and s.st_uid == user.pw_uid and s.st_gid == user.pw_gid
          and stat.S_IMODE(s.st_mode) == 0o700, 'EXISTING_DIRECTORY_REVIEW')
+
+
+def configuration(path, user):
+    """Root owns directory entries; the exclusive service group can traverse.
+
+    service.env: root:root 0600. internal-key: service:service 0400 (the
+    unchanged 1B.5 adapters forbid group/other key access). No files are created
+    here and existing incompatible directories/files are NEVER repaired.
+    """
+    p = canonical(path, exists=False)
+    if not p.exists():
+        p.mkdir(mode=0o750)
+        os.chown(p, 0, user.pw_gid)
+        p.chmod(0o750)
+    s = p.stat()
+    need(p.is_dir() and s.st_uid == 0 and s.st_gid == user.pw_gid
+         and stat.S_IMODE(s.st_mode) == 0o750, 'CONFIG_DIRECTORY_REVIEW')
+    for item in p.iterdir():
+        need(item.name in ('service.env', 'internal-key') and not item.is_symlink(), 'CONFIG_FILE_REVIEW')
+        s = item.lstat()
+        uid, gid, mode = (0, 0, 0o600) if item.name == 'service.env' else (user.pw_uid, user.pw_gid, 0o400)
+        need(stat.S_ISREG(s.st_mode) and s.st_uid == uid and s.st_gid == gid
+             and stat.S_IMODE(s.st_mode) == mode and s.st_nlink == 1, 'CONFIG_FILE_REVIEW')
+
+
+def install_node(archive, dest, version):
+    """A published destination is read-only, even if it is missing one file."""
+    if dest.exists() or dest.is_symlink():
+        verify_node(archive, dest, version, uid=0, gid=0)
+        return
+    number = 0
+    attempt = dest.with_name(dest.name + '.preparing-0')
+    while attempt.exists() or attempt.is_symlink() or attempt.with_name(attempt.name + '.owner.json').exists():
+        number += 1
+        attempt = dest.with_name(dest.name + f'.preparing-{number}')
+    extract_node(archive, attempt, version)
+    verify_node(archive, attempt, version, uid=0, gid=0)
+    publish_node(attempt, dest)
 
 
 def main():
@@ -60,25 +100,13 @@ def main():
         opt = canonical('/opt')
         need(opt.stat().st_uid == 0 and not opt.stat().st_mode & 0o022, 'OPT_PERMISSIONS')
         dest = opt / f'node-{a.version}-linux-x64'
-        if dest.exists():
-            need(dest.stat().st_uid == 0 and not dest.stat().st_mode & 0o022, 'NODE_OWNER')
-        if dest.exists():
-            extract_node(archive, dest, a.version)
-        else:
-            number = 0
-            attempt = opt / (dest.name + '.preparing-0')
-            while attempt.exists() or attempt.is_symlink():
-                number += 1
-                attempt = opt / (dest.name + f'.preparing-{number}')
-            extract_node(archive, attempt, a.version)
-            attempt.rename(dest)
-        for p in [dest, *dest.rglob('*')]:
-            need(p.lstat().st_uid == 0 and (p.is_symlink() or not p.stat().st_mode & 0o022), 'NODE_OWNER_MODE')
+        install_node(archive, dest, a.version)
         amazonia, portal = account('amazonia'), account('atelier-portail')
         for path, owner in [('/var/lib/amazonia', amazonia), ('/var/lib/amazonia/data', amazonia),
-                            ('/var/lib/amazonia/data/campaigns', amazonia),
-                            ('/etc/amazonia', amazonia), ('/etc/atelier-portail', portal)]:
+                            ('/var/lib/amazonia/data/campaigns', amazonia)]:
             dedicated(path, owner)
+        configuration('/etc/amazonia', amazonia)
+        configuration('/etc/atelier-portail', portal)
         # No marker, no secrets, no data copy into production storage in phase P.
         need(not list(Path('/var/lib/amazonia/data/campaigns').iterdir()), 'PRODUCTION_STORAGE_NOT_EMPTY')
         need(list(Path('/var/lib/amazonia/data').iterdir()) == [Path('/var/lib/amazonia/data/campaigns')], 'PRODUCTION_STORAGE_NOT_EMPTY')

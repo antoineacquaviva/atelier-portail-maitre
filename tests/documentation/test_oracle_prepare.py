@@ -30,6 +30,24 @@ def snapshot(root):
     return result
 
 
+def node_archive(path):
+    """Small authenticated-distribution stand-in; never an executable Node."""
+    prefix = 'node-v24.22.1-linux-x64'
+    with tarfile.open(path, 'w:xz') as t:
+        for n in ('', '/bin', '/lib'):
+            item = tarfile.TarInfo(prefix + n)
+            item.type = tarfile.DIRTYPE
+            item.mode = 0o755
+            t.addfile(item)
+        for n, data, mode in [('bin/node', b'fixture-node', 0o755), ('lib/npm.mjs', b'fixture-npm', 0o644)]:
+            item = tarfile.TarInfo(prefix + '/' + n)
+            item.size, item.mode = len(data), mode
+            t.addfile(item, io.BytesIO(data))
+        item = tarfile.TarInfo(prefix + '/bin/npm')
+        item.type, item.linkname = tarfile.SYMTYPE, '../lib/npm.mjs'
+        t.addfile(item)
+
+
 class Fixtures(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='oracle-P-fixtures-')
@@ -178,20 +196,100 @@ class Fixtures(unittest.TestCase):
                 else:
                     i.size = len(data)
                 t.addfile(i, None if data is None else io.BytesIO(data))
-        target = self.base / 'node'
+        target = self.base / 'node.preparing-0'
         p.extract_node(archive, target, 'v24.22.1')
-        p.extract_node(archive, target, 'v24.22.1')
+        p.extract_node(archive, target, 'v24.22.1', resume=True)
         (target / 'bin/node').write_text('foreign')
         with self.assertRaisesRegex(p.Stop, 'NODE_TARGET_DIFFERENT'):
-            p.extract_node(archive, target, 'v24.22.1')
+            p.extract_node(archive, target, 'v24.22.1', resume=True)
         evil = self.base / 'evil.tar.xz'
         with tarfile.open(evil, 'w:xz') as t:
             i = tarfile.TarInfo('node-v24.22.1-linux-x64/../../escape')
             i.size = 0
             t.addfile(i, io.BytesIO())
         with self.assertRaisesRegex(p.Stop, 'NODE_ARCHIVE_PATH'):
-            p.extract_node(evil, self.base / 'evil', 'v24.22.1')
+            p.extract_node(evil, self.base / 'evil.preparing-0', 'v24.22.1')
         self.assertFalse((self.base / 'escape').exists())
+
+    def test_published_node_is_verified_without_any_write(self):
+        archive = self.base / 'complete-node.tar.xz'
+        node_archive(archive)
+        temp = self.base / 'node.preparing-0'
+        target = self.base / 'node-v24.22.1-linux-x64'
+        p.extract_node(archive, temp, 'v24.22.1')
+        p.publish_node(temp, target)
+        before = snapshot(self.base)
+        p.verify_node(archive, target, 'v24.22.1')
+        self.assertEqual(snapshot(self.base), before)
+        # Even a caller accidentally choosing extract may not repair a final path.
+        with self.assertRaisesRegex(p.Stop, 'NODE_TEMP_PATH'):
+            p.extract_node(archive, target, 'v24.22.1', resume=True)
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_published_node_rejects_missing_content_links_modes_without_repair(self):
+        archive = self.base / 'complete-node.tar.xz'
+        node_archive(archive)
+        def missing_file(root):
+            (root / 'lib/npm.mjs').unlink()
+        def extra_file(root):
+            (root / 'extra').write_text('unexpected')
+        def changed_file(root):
+            (root / 'bin/node').write_bytes(b'wrong bytes')
+        def bad_mode(root):
+            (root / 'bin/node').chmod(0o777)
+        def bad_directory_mode(root):
+            (root / 'lib').chmod(0o700)
+        def bad_link(root):
+            (root / 'bin/npm').unlink()
+            (root / 'bin/npm').symlink_to('/etc/passwd')
+        def bad_hardlink(root):
+            os.link(root / 'bin/node', self.base / ('hardlink-' + root.name))
+        for number, mutate in enumerate((missing_file, extra_file, changed_file, bad_mode, bad_directory_mode, bad_link, bad_hardlink)):
+            with self.subTest(mutate=mutate.__name__):
+                temp = self.base / f'node.preparing-{number}'
+                final = self.base / f'published-{number}'
+                p.extract_node(archive, temp, 'v24.22.1')
+                p.publish_node(temp, final)
+                mutate(final)
+                before = snapshot(self.base)
+                with self.assertRaises(p.Stop):
+                    p.verify_node(archive, final, 'v24.22.1')
+                self.assertEqual(snapshot(self.base), before)
+
+    def test_only_owned_temporary_node_can_resume_missing_files(self):
+        archive = self.base / 'complete-node.tar.xz'
+        node_archive(archive)
+        temp = self.base / 'node.preparing-0'
+        old_mask = os.umask(0o077)
+        try:
+            p.extract_node(archive, temp, 'v24.22.1')
+        finally:
+            os.umask(old_mask)
+        (temp / 'lib/npm.mjs').unlink()
+        before = snapshot(temp)
+        with self.assertRaisesRegex(p.Stop, 'NODE_TEMP_UNOWNED'):
+            p.extract_node(archive, temp, 'v24.22.1')
+        self.assertEqual(snapshot(temp), before)
+        p.extract_node(archive, temp, 'v24.22.1', resume=True)
+        p.verify_node(archive, temp, 'v24.22.1')
+        foreign = self.base / 'foreign.preparing-0'
+        foreign.mkdir()
+        before = snapshot(foreign)
+        with self.assertRaisesRegex(p.Stop, 'NODE_TEMP_UNOWNED'):
+            p.extract_node(archive, foreign, 'v24.22.1', resume=True)
+        self.assertEqual(snapshot(foreign), before)
+
+    def test_node_publication_refuses_even_an_empty_existing_destination(self):
+        archive = self.base / 'complete-node.tar.xz'
+        node_archive(archive)
+        temp = self.base / 'node.preparing-0'
+        p.extract_node(archive, temp, 'v24.22.1')
+        final = self.base / 'already-published'
+        final.mkdir()
+        before = snapshot(self.base)
+        with self.assertRaisesRegex(p.Stop, 'NODE_DESTINATION_EXISTS'):
+            p.publish_node(temp, final)
+        self.assertEqual(snapshot(self.base), before)
 
     def test_dedicated_existing_directory_is_never_chowned_or_chmodded(self):
         user = type('User', (), {'pw_uid': os.getuid(), 'pw_gid': os.getgid()})()
@@ -205,6 +303,20 @@ class Fixtures(unittest.TestCase):
             with self.assertRaisesRegex(p.Stop, 'EXISTING_DIRECTORY_REVIEW'):
                 provision.dedicated(dest, user)
             self.assertEqual(stat_mode(dest), 0o755)
+
+    def test_configuration_group_must_be_exclusive_to_its_service(self):
+        from types import SimpleNamespace
+        user = SimpleNamespace(pw_uid=120, pw_gid=120, pw_shell='/sbin/nologin')
+        group = SimpleNamespace(gr_name='amazonia', gr_mem=['neighbor'])
+        with patch.object(provision.pwd, 'getpwnam', return_value=user), \
+             patch.object(provision.grp, 'getgrgid', return_value=group):
+            with self.assertRaisesRegex(p.Stop, 'ACCOUNT_GROUP'):
+                provision.account('amazonia')
+            group.gr_mem = []
+            other = SimpleNamespace(pw_uid=121, pw_gid=120)
+            with patch.object(provision.pwd, 'getpwall', return_value=[user, other]):
+                with self.assertRaisesRegex(p.Stop, 'ACCOUNT_SHARED_GROUP'):
+                    provision.account('amazonia')
 
     def test_history_layout_links_counts_and_empty_files(self):
         self.assertEqual(len(p.history_inventory(self.history / 'data')), 16)

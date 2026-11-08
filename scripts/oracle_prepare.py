@@ -2,6 +2,8 @@
 """Phase P only. No service management, active data access or secret generation."""
 import argparse
 import contextlib
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -187,55 +189,130 @@ def download(url, destination, expected=None, limit=200 * 1024 * 1024):
         raise Stop('DOWNLOAD_FAILED') from None
 
 
-def extract_node(archive, target, version):
-    """Exclusive/resumable extraction of an authenticated official Node tarball.
+def node_members(t, target, version):
+    """Parse the authenticated archive without writing or trusting target links."""
+    prefix = f'node-{version}-linux-x64'
+    members = {}
+    for m in t.getmembers():
+        parts = PurePosixPath(m.name).parts
+        need(parts and parts[0] == prefix and '..' not in parts and not m.name.startswith('/'), 'NODE_ARCHIVE_PATH')
+        rel = Path(*parts[1:]).as_posix()
+        need(rel not in members, 'NODE_ARCHIVE_DUPLICATE')
+        need(m.isdir() or m.isfile() or m.issym(), 'NODE_ARCHIVE_TYPE')
+        if m.issym():
+            need(not PurePosixPath(m.linkname).is_absolute(), 'NODE_ARCHIVE_LINK')
+            normalized = Path(os.path.normpath(target / Path(rel).parent / m.linkname))
+            need(normalized.is_relative_to(target), 'NODE_ARCHIVE_LINK')
+        members[rel] = m
+    need('.' in members and members['.'].isdir(), 'NODE_ARCHIVE_ROOT')
+    for rel in members:
+        parent = Path(rel).parent
+        while str(parent) != '.':
+            need(parent.as_posix() in members and members[parent.as_posix()].isdir(), 'NODE_ARCHIVE_PARENT')
+            parent = parent.parent
+    return members
 
-    Existing members must match bytes/type/mode. Links are only internal, and
-    created last. No tar.extractall, owner restoration, special files or escapes.
+
+def inspect_node(t, target, members, uid, gid, complete=True):
+    """Read-only, full comparison. Never mkdir/chmod/chown/write a Node member."""
+    actual = {'.': target}
+    actual.update({p.relative_to(target).as_posix(): p for p in target.rglob('*')})
+    need(set(actual) <= set(members), 'NODE_TARGET_EXTRA')
+    if complete:
+        need(set(actual) == set(members), 'NODE_TARGET_INCOMPLETE')
+    # Validate all types/permissions before opening files or resolving symlinks.
+    for rel, path in actual.items():
+        m, s = members[rel], path.lstat()
+        need(s.st_uid == uid and s.st_gid == gid, 'NODE_TARGET_OWNER')
+        if m.isdir():
+            need(stat.S_ISDIR(s.st_mode) and stat.S_IMODE(s.st_mode) == 0o755, 'NODE_TARGET_MODE')
+        elif m.issym():
+            need(stat.S_ISLNK(s.st_mode) and stat.S_IMODE(s.st_mode) == 0o777
+                 and os.readlink(path) == m.linkname, 'NODE_TARGET_LINK')
+        else:
+            mode = 0o755 if m.mode & 0o111 else 0o644
+            need(stat.S_ISREG(s.st_mode) and stat.S_IMODE(s.st_mode) == mode, 'NODE_TARGET_MODE')
+            need(s.st_nlink == 1, 'NODE_TARGET_HARDLINK')
+    for rel, path in actual.items():
+        m = members[rel]
+        if m.isfile():
+            with t.extractfile(m) as f:
+                need(sha(path) == hashlib.sha256(f.read()).hexdigest(), 'NODE_TARGET_DIFFERENT')
+        elif m.issym() and complete:
+            try:
+                resolved = path.resolve(strict=True)
+            except (OSError, RuntimeError):
+                raise Stop('NODE_TARGET_LINK') from None
+            need(resolved.is_relative_to(target), 'NODE_TARGET_LINK')
+
+
+def verify_node(archive, target, version, uid=None, gid=None):
+    """Existing published installations are ONLY verified, never repaired."""
+    target = canonical(target)
+    need(target.is_dir(), 'NODE_TARGET')
+    with tarfile.open(archive, 'r:xz') as t:
+        members = node_members(t, target, version)
+        inspect_node(t, target, members, os.geteuid() if uid is None else uid,
+                     os.getegid() if gid is None else gid)
+
+
+def extract_node(archive, target, version, resume=False):
+    """Extract ONLY in an explicitly owned temporary .preparing-N directory.
+
+    A matching adjacent 0600 marker is mandatory for partial resume. Published
+    destinations never pass through this function, even when incomplete.
     """
     target = canonical(target, exists=False)
-    prefix = f'node-{version}-linux-x64'
+    need(re.fullmatch(r'[A-Za-z0-9_.-]+\.preparing-[0-9]+', target.name), 'NODE_TEMP_PATH')
+    parent = canonical(target.parent)
+    need(parent.stat().st_uid == os.geteuid() and not parent.stat().st_mode & 0o022, 'NODE_TEMP_PARENT')
+    marker = target.with_name(target.name + '.owner.json')
+    identity = {'format': 1, 'target': str(target), 'version': version, 'archive': sha(archive)}
     with tarfile.open(archive, 'r:xz') as t:
-        members = []
-        seen = set()
-        for m in t.getmembers():
-            parts = PurePosixPath(m.name).parts
-            need(parts and parts[0] == prefix and '..' not in parts and not m.name.startswith('/'), 'NODE_ARCHIVE_PATH')
-            rel = Path(*parts[1:])
-            need(str(rel) not in seen, 'NODE_ARCHIVE_DUPLICATE')
-            seen.add(str(rel))
-            need(m.isdir() or m.isfile() or m.issym(), 'NODE_ARCHIVE_TYPE')
-            if m.issym():
-                need(not PurePosixPath(m.linkname).is_absolute(), 'NODE_ARCHIVE_LINK')
-                need((target / rel.parent / m.linkname).resolve().is_relative_to(target), 'NODE_ARCHIVE_LINK')
-            members.append((m, rel))
-        target.mkdir(mode=0o755, exist_ok=True)
-        need(target.is_dir() and not target.is_symlink(), 'NODE_TARGET')
-        allowed = {rel.as_posix() for m, rel in members if str(rel) != '.'}
-        need({p.relative_to(target).as_posix() for p in target.rglob('*')} <= allowed, 'NODE_TARGET_EXTRA')
-        for m, rel in sorted(members, key=lambda pair: pair[0].issym()):
-            p = target / rel
-            need(p.parent.resolve().is_relative_to(target) or p == target, 'NODE_PARENT')
+        members = node_members(t, target, version)
+        if target.exists() or marker.exists() or marker.is_symlink():
+            need(resume and marker.is_file() and not marker.is_symlink(), 'NODE_TEMP_UNOWNED')
+            s = marker.stat()
+            need(s.st_uid == os.geteuid() and s.st_gid == os.getegid()
+                 and stat.S_IMODE(s.st_mode) == 0o600 and s.st_nlink == 1
+                 and json.loads(marker.read_text()) == identity, 'NODE_TEMP_UNOWNED')
+        else:
+            write_new(marker, json.dumps(identity))
+        if not target.exists():
+            target.mkdir(mode=0o755)
+            target.chmod(0o755)  # newly created only; independent of operator umask
+        inspect_node(t, target, members, os.geteuid(), os.getegid(), complete=False)
+        # Directories first, then ordinary files, symlinks last. Existing entries
+        # were fully verified above and are never rewritten, including on resume.
+        ordered = sorted(members.items(), key=lambda pair: (0 if pair[1].isdir() else 2 if pair[1].issym() else 1, len(Path(pair[0]).parts)))
+        for rel, m in ordered:
+            path = target / rel
+            if path.exists() or path.is_symlink():
+                continue
             if m.isdir():
-                need(not p.is_symlink(), 'NODE_TARGET_LINK')
-                p.mkdir(mode=0o755, exist_ok=True)
+                path.mkdir(mode=0o755)
+                path.chmod(0o755)
             elif m.issym():
-                if p.is_symlink():
-                    need(os.readlink(p) == m.linkname, 'NODE_TARGET_DIFFERENT')
-                else:
-                    need(not p.exists(), 'NODE_TARGET_DIFFERENT')
-                    p.symlink_to(m.linkname)
+                path.symlink_to(m.linkname)
             else:
-                mode = 0o755 if m.mode & 0o111 else 0o644
-                if p.exists() or p.is_symlink():
-                    need(p.is_file() and not p.is_symlink(), 'NODE_TARGET_DIFFERENT')
-                    with t.extractfile(m) as f:
-                        need(sha(p) == hashlib.sha256(f.read()).hexdigest(), 'NODE_TARGET_DIFFERENT')
-                    need(stat.S_IMODE(p.stat().st_mode) == mode, 'NODE_TARGET_MODE')
-                else:
-                    with t.extractfile(m) as source, p.open('xb') as dest:
-                        shutil.copyfileobj(source, dest)
-                    p.chmod(mode)
+                with t.extractfile(m) as source, path.open('xb') as dest:
+                    shutil.copyfileobj(source, dest)
+                path.chmod(0o755 if m.mode & 0o111 else 0o644)
+        inspect_node(t, target, members, os.geteuid(), os.getegid())
+
+
+def publish_node(source, target):
+    """Linux atomic publication with NO replacement, including empty targets."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = libc.renameat2
+    except AttributeError:
+        raise Stop('NODE_PUBLISH_UNSUPPORTED') from None
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
+        code = ctypes.get_errno()
+        raise Stop('NODE_DESTINATION_EXISTS' if code in (errno.EEXIST, errno.ENOTEMPTY) else 'NODE_PUBLISH_FAILED')
 
 
 def tree_digest(root):
@@ -417,16 +494,16 @@ class Preparation:
         need(f"{self.c['node_sha256']}  {archive.name}" in lines, 'OFFICIAL_CHECKSUM_MISMATCH')
         final = folder / 'node'
         if final.exists() or final.is_symlink():
-            extract_node(archive, final, version)  # verify compatible published result
+            verify_node(archive, final, version)
         else:
             attempt = 0
             candidate = folder / 'node.preparing-0'
-            while candidate.exists() or candidate.is_symlink():
+            while candidate.exists() or candidate.is_symlink() or candidate.with_name(candidate.name + '.owner.json').exists():
                 attempt += 1
                 candidate = folder / f'node.preparing-{attempt}'
             extract_node(archive, candidate, version)
             need(command([candidate / 'bin/node', '--version']).strip() == version, 'NODE_RUNTIME_VERSION')
-            candidate.rename(final)
+            publish_node(candidate, final)
         self.node_binary = folder / 'node/bin/node'
         need(command([self.node_binary, '--version']).strip() == version, 'NODE_RUNTIME_VERSION')
         checked([self.node_binary, '-e', 'const {DatabaseSync}=require("node:sqlite"); const d=new DatabaseSync(":memory:"); d.close()'], 'SQLITE_IMPORT_FAILED')
