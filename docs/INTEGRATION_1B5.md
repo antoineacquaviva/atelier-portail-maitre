@@ -1,5 +1,7 @@
 # 1B.5 — entrée personnelle commune, préparation uniquement
 
+PR coordonnées : [portail #1](https://github.com/antoineacquaviva/atelier-portail-maitre/pull/1) et [Amazonia #6](https://github.com/antoineacquaviva/Amazonia/pull/6). Revue commune et autorisation de déploiement séparée requises.
+
 Base portail : `456199e66814958edc40d5580a0f73744fecc2ac`. Amazonia doit inclure PR #5 fusionnée (base `cb80c06`) et la PR associée 1B.5. Aucun déploiement, changement Oracle ou données réelles pendant cette mission. Les deux PR attendent revue ChatGPT et validation du propriétaire. La fusion et le déploiement sont deux décisions distinctes.
 
 ## Responsabilités et flux
