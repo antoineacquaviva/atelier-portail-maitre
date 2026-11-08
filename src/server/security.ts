@@ -2,7 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { RequestHandler } from "express";
-export function internalGuard(): RequestHandler {
+export function internalGuard(
+  jsonRequired: (requestPath: string) => boolean = () => true,
+): RequestHandler {
   const file = process.env.ATELIER_INTERNAL_KEY_FILE;
   const origins = (process.env.ATELIER_PUBLIC_ORIGINS ?? "")
     .split(",")
@@ -43,11 +45,13 @@ export function internalGuard(): RequestHandler {
       req.headers["sec-fetch-site"] === "cross-site" ||
       (!["GET", "HEAD"].includes(req.method) &&
         (!origins.includes(String(req.headers.origin ?? "")) ||
-          req.is("application/json") !== "application/json"))
+          (jsonRequired(req.path) &&
+            req.is("application/json") !== "application/json")))
     ) {
       res.status(403).json({ error: "Origine ou contenu refusé" });
       return;
     }
+    if (!jsonRequired(req.path)) res.removeHeader("Cache-Control");
     next();
   };
 }

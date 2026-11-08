@@ -1,3 +1,4 @@
+import {prepareToolDirectory} from "./src/server/toolDirectory";
 import {checkGitTarget} from "./src/server/gitTarget";
 import {amazoniaRuntime, amazoniaUnit} from "./src/server/amazoniaDeployment";
 import {internalGuard, proxyHeaders} from "./src/server/security";
@@ -100,17 +101,7 @@ const DEFAULT_TOOLS: ToolItem[] = [
   },
 ];
 
-function ensureSrvJeuPermissions() {
-  if (!isOracleVm) return;
-  try {
-    execSync(`sudo mkdir -p /srv/jeu && sudo chown -R opc:opc /srv/jeu`);
-  } catch {
-    // ignore if sudo not available yet
-  }
-}
-
 function loadToolsRegistry(): ToolItem[] {
-  ensureSrvJeuPermissions();
   try {
     if (fs.existsSync(REGISTRY_PATH)) {
       const raw = fs.readFileSync(REGISTRY_PATH, 'utf-8');
@@ -128,10 +119,9 @@ function loadToolsRegistry(): ToolItem[] {
 
 function saveToolsRegistry(tools: ToolItem[]) {
   try {
-    ensureSrvJeuPermissions();
     const dir = path.dirname(REGISTRY_PATH);
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      throw new Error("Parent du registre à préparer manuellement");
     }
     fs.writeFileSync(REGISTRY_PATH, JSON.stringify(tools, null, 2), 'utf-8');
   } catch {
@@ -180,7 +170,7 @@ function isPortListening(port: number): boolean {
 
 /**
  * Clones or updates a GitHub repository into vmPath, handling both HTTPS (public)
- * and SSH (private or authenticated) URLs, and fixing /srv/jeu permissions first.
+ * and SSH (private or authenticated) URLs. Shared parents are operator-provisioned.
  */
 function cloneOrUpdateGitRepo(
   repo: string,
@@ -190,16 +180,11 @@ function cloneOrUpdateGitRepo(
 ): string {
   checkGitTarget(vmPath);
   if (repo.toLowerCase()==='antoineacquaviva/amazonia') amazoniaRuntime();
-  ensureSrvJeuPermissions();
-  const parentDir = path.dirname(vmPath);
-  execSync(`sudo mkdir -p "${parentDir}" && sudo chown -R opc:opc "${parentDir}"`);
+  prepareToolDirectory(vmPath);
 
   const hasGit = fs.existsSync(path.join(vmPath, '.git'));
   if (!hasGit) {
-    // If directory exists but has no .git, remove it if empty or clean it before cloning
-    if (fs.existsSync(vmPath)) {
-      fs.rmdirSync(vmPath); // checkGitTarget proved the directory empty; never recursively remove.
-    }
+    // Git can clone into an existing empty directory; do not replace its owner/mode.
     log(`Clonage du dépôt GitHub ${repo} dans ${vmPath}...`);
     try {
       runCmdWithDetails(`git clone https://github.com/${repo}.git "${vmPath}"`);
@@ -560,7 +545,6 @@ function autoDetectBuildAndStartService(
     syncCaddyConfig(log); saveToolsRegistry(toolsState); return;
   }
 
-  ensureSrvJeuPermissions();
   const cleanSub = tool.subpath.replace(/\/+$/, '');
   const pkgJsonPath = path.join(tool.vmPath, 'package.json');
   const appPyPath = path.join(tool.vmPath, 'app.py');
@@ -772,7 +756,10 @@ export async function createPortalApp(tools?: ToolItem[], web=true) {
   for (const tool of toolsState) validateTool(tool);
   const app = express();
   app.disable("x-powered-by");
-  app.use(internalGuard());
+  // Only unrelated tool flows may use forms/binary bodies and their own cache policy.
+  app.use(internalGuard((requestPath) => !toolsState.some(t =>
+    !isAmazonia(t) && (requestPath === t.subpath || requestPath.startsWith(t.subpath + "/"))
+  )));
 
   app.use(express.json({ limit: '256kb' }));
 
@@ -855,7 +842,6 @@ export async function createPortalApp(tools?: ToolItem[], web=true) {
 
       if (isOracleVm) {
         try {
-          ensureSrvJeuPermissions();
           const hasFiles =
             fs.existsSync(tool.vmPath) &&
             fs.readdirSync(tool.vmPath).filter((f) => f !== '.git').length > 0;
@@ -1081,7 +1067,6 @@ export async function createPortalApp(tools?: ToolItem[], web=true) {
 
     try {
       if (isOracleVm) {
-        ensureSrvJeuPermissions();
         if (body.initialSource === 'git') {
           const rev = cloneOrUpdateGitRepo(newTool.repo, newTool.branch, vmPath, log);
           newTool.commitHash = rev;
@@ -1118,7 +1103,6 @@ export async function createPortalApp(tools?: ToolItem[], web=true) {
     }
 
     try {
-      ensureSrvJeuPermissions();
       execSync(
         `cd "${portalDir}" && git fetch origin main && git reset --hard origin/main && NODE_ENV=development npm install --include=dev --legacy-peer-deps && npm run build`
       );
@@ -1225,7 +1209,7 @@ export async function createPortalApp(tools?: ToolItem[], web=true) {
       btn.disabled = true;
       btn.textContent = 'Installation & Compilation Vite en cours (patientez ~20s)...';
       box.style.display = 'block';
-      box.textContent = 'Correction des permissions /srv/jeu, clonage GitHub (' + ${JSON.stringify(matchedTool.repo)} + ') et compilation Vite...';
+      box.textContent = 'Préparation ciblée du répertoire de l’outil, clonage GitHub (' + ${JSON.stringify(matchedTool.repo)} + ') et compilation Vite...';
       try {
         const res = await fetch('/api/tools/${matchedTool.id}/action', {
           method: 'POST',

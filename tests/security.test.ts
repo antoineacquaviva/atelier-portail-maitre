@@ -215,7 +215,27 @@ test(
     );
     const t = tool(port(a));
     const otherApp = express();
-    otherApp.use((req, res) => res.json(req.headers));
+    otherApp.use((req, res) => {
+      if (req.path !== "/flow") {
+        res.json(req.headers);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      req.on("end", () => {
+        res.setHeader("Set-Cookie", [
+          "tool-session=fake; Path=/other/; HttpOnly",
+          "tool-pref=1; Path=/other/",
+        ]);
+        res.setHeader("Cache-Control", "private, max-age=17");
+        res.status(201).json({
+          headers: req.headers,
+          method: req.method,
+          url: req.originalUrl,
+          body: Buffer.concat(chunks).toString("base64"),
+        });
+      });
+    });
     const other = await listen(otherApp);
     const otherTool = {
       ...tool(port(other)),
@@ -327,6 +347,50 @@ test(
       assert.equal(echo["x-atelier-internal"], undefined);
       assert.equal(echo.authorization, undefined);
       assert.equal(echo["x-user"], undefined);
+      // Native Caddy path and portal proxy must both preserve tools' own cookie/token and non-JSON flows.
+      for (const entry of [base, `http://127.0.0.1:${port(portal)}`]) {
+        for (const contentType of [
+          "application/octet-stream",
+          "multipart/form-data; boundary=demo",
+          "application/x-www-form-urlencoded",
+        ]) {
+          const payload = "--demo\r\ncontent=hello&value=%2F\u0000\r\n--demo--";
+          const response = await fetch(entry + "/other/flow?q=a%2Fb", {
+            method: "POST",
+            headers: {
+              Authorization: basic,
+              "x-atelier-internal": cfg.key,
+              Origin: origin,
+              "Content-Type": contentType,
+              Cookie: "tool-session=existing; tool-pref=2",
+              "X-App-Token": "fictitious-tool-token",
+            },
+            body: payload,
+          });
+          assert.equal(response.status, 201);
+          assert.equal(
+            response.headers.get("cache-control"),
+            "private, max-age=17",
+          );
+          assert.deepEqual(response.headers.getSetCookie(), [
+            "tool-session=fake; Path=/other/; HttpOnly",
+            "tool-pref=1; Path=/other/",
+          ]);
+          const flow = await response.json();
+          assert.equal(flow.method, "POST");
+          assert.equal(flow.url, "/flow?q=a%2Fb");
+          assert.equal(flow.body, Buffer.from(payload).toString("base64"));
+          assert.equal(
+            flow.headers.cookie,
+            "tool-session=existing; tool-pref=2",
+          );
+          assert.equal(flow.headers["content-type"], contentType);
+          assert.equal(flow.headers["x-app-token"], "fictitious-tool-token");
+          assert.equal(flow.headers.authorization, undefined);
+          assert.equal(flow.headers["x-atelier-internal"], undefined);
+        }
+      }
+
       assert.equal(
         (
           await fetch(`http://127.0.0.1:${port(a)}/api/health`, {
