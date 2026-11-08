@@ -21,7 +21,7 @@ export const DeployVersionModal: React.FC<DeployVersionModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const [source, setSource] = useState<'git' | 'zip'>(tool.lastSource || 'git');
+  const [source, setSource] = useState<'git' | 'zip'>('git');
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [commitMessage, setCommitMessage] = useState<string>(
     `feat(${tool.id}): nouvelle version depuis discussion Gemini`
@@ -116,7 +116,7 @@ export const DeployVersionModal: React.FC<DeployVersionModalProps> = ({
         {/* Source Selector */}
         <div className="space-y-2">
           <label className="text-xs font-medium text-slate-300">
-            D’où provient cette nouvelle version ? (Vous pouvez alterner librement entre les deux sources)
+            Déploiement Git uniquement ; les archives nécessitent une préparation manuelle.
           </label>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <button
@@ -139,6 +139,8 @@ export const DeployVersionModal: React.FC<DeployVersionModalProps> = ({
 
             <button
               type="button"
+              disabled
+              title="Archives : staging manuel requis"
               onClick={() => setSource('zip')}
               className={`p-4 rounded-xl border text-left transition-colors space-y-1.5 ${
                 source === 'zip'
@@ -151,7 +153,7 @@ export const DeployVersionModal: React.FC<DeployVersionModalProps> = ({
                 <span>Source 2 : Discussion Gemini (.zip)</span>
               </div>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Téléversez directement le <span className="font-mono">.zip</span> ici (0 dépôt requis sur PC). La VM déploie l’archive et pousse sur GitHub.
+                Désactivé : préparer et vérifier l’archive manuellement hors des données persistantes.
               </p>
             </button>
           </div>

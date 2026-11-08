@@ -260,7 +260,7 @@ export const NewToolModal: React.FC<NewToolModalProps> = ({
               { id: 'flask', label: 'Python Flask (app.py)' },
               { id: 'node', label: 'Node.js / Express (AI Studio)' },
               { id: 'static-python', label: 'HTML/JS Statique' },
-              { id: 'custom', label: 'Personnalisé' },
+
             ].map((p) => (
               <button
                 key={p.id}
@@ -282,6 +282,8 @@ export const NewToolModal: React.FC<NewToolModalProps> = ({
               <label className="text-slate-400">Commande de démarrage (ExecStart) :</label>
               <input
                 type="text"
+                readOnly
+                title="Recette déterminée par le serveur ; commande HTTP ignorée"
                 value={execStart}
                 onChange={(e) => setExecStart(e.target.value)}
                 className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
@@ -294,6 +296,8 @@ export const NewToolModal: React.FC<NewToolModalProps> = ({
               <input
                 type="text"
                 placeholder="ex: npm install --legacy-peer-deps && npm run build"
+                readOnly
+                title="Recette déterminée par le serveur ; commande HTTP ignorée"
                 value={buildCmd}
                 onChange={(e) => setBuildCmd(e.target.value)}
                 className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
@@ -328,6 +332,8 @@ export const NewToolModal: React.FC<NewToolModalProps> = ({
 
             <button
               type="button"
+              disabled
+              title="Archives : staging manuel requis"
               onClick={() => setInitialSource('zip')}
               className={`p-3.5 rounded-xl border text-left transition-colors ${
                 initialSource === 'zip'
@@ -340,7 +346,7 @@ export const NewToolModal: React.FC<NewToolModalProps> = ({
                 <span>Téléverser un .zip Gemini (Source 2)</span>
               </div>
               <p className="text-slate-400 mt-1">
-                La VM extrait le .zip et pousse la version initiale sur votre dépôt GitHub.
+                Désactivé : staging manuel et vérification de l’archive requis.
               </p>
             </button>
           </div>

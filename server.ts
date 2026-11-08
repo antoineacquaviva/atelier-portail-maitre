@@ -1,9 +1,14 @@
+import {checkGitTarget} from "./src/server/gitTarget";
+import {amazoniaRuntime, amazoniaUnit} from "./src/server/amazoniaDeployment";
+import {internalGuard, proxyHeaders} from "./src/server/security";
+import {generateCaddyfile} from "./src/server/caddyConfig";
+import {actions, validateTool, isAmazonia} from "./src/server/validation";
 import express from 'express';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { execSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
 import type {
   ToolItem,
@@ -134,7 +139,7 @@ function saveToolsRegistry(tools: ToolItem[]) {
   }
 }
 
-let toolsState: ToolItem[] = loadToolsRegistry();
+let toolsState: ToolItem[] = structuredClone(DEFAULT_TOOLS);
 
 /**
  * Helper to execute a command on the VM and format detailed stderr/stdout if it fails.
@@ -183,6 +188,8 @@ function cloneOrUpdateGitRepo(
   vmPath: string,
   log: (msg: string) => void
 ): string {
+  checkGitTarget(vmPath);
+  if (repo.toLowerCase()==='antoineacquaviva/amazonia') amazoniaRuntime();
   ensureSrvJeuPermissions();
   const parentDir = path.dirname(vmPath);
   execSync(`sudo mkdir -p "${parentDir}" && sudo chown -R opc:opc "${parentDir}"`);
@@ -191,7 +198,7 @@ function cloneOrUpdateGitRepo(
   if (!hasGit) {
     // If directory exists but has no .git, remove it if empty or clean it before cloning
     if (fs.existsSync(vmPath)) {
-      execSync(`sudo rm -rf "${vmPath}"`);
+      fs.rmdirSync(vmPath); // checkGitTarget proved the directory empty; never recursively remove.
     }
     log(`Clonage du dépôt GitHub ${repo} dans ${vmPath}...`);
     try {
@@ -256,7 +263,7 @@ function refreshLiveVmStates() {
 }
 
 function getVmPrerequisites(): VmPrerequisites {
-  const sudoersCommand = `echo "opc ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/atelier-portail && sudo chmod 440 /etc/sudoers.d/atelier-portail`;
+  const sudoersCommand = `Privilèges limités à définir et valider manuellement ; aucun sudo général recommandé.`;
   if (!isOracleVm) {
     return {
       sshPublicKey:
@@ -275,8 +282,7 @@ function getVmPrerequisites(): VmPrerequisites {
     } else if (fs.existsSync(rsaKeyPath)) {
       sshPublicKey = fs.readFileSync(rsaKeyPath, 'utf-8').trim();
     } else {
-      execSync(`ssh-keygen -t ed25519 -N "" -f /home/opc/.ssh/id_ed25519 -q`);
-      sshPublicKey = fs.readFileSync(pubKeyPath, 'utf-8').trim();
+      sshPublicKey = 'Clé à préparer manuellement par le propriétaire';
     }
   } catch {
     sshPublicKey = 'Clé SSH non lisible (vérifiez /home/opc/.ssh/id_ed25519.pub)';
@@ -290,61 +296,16 @@ function getVmPrerequisites(): VmPrerequisites {
   };
 }
 
-function generateCaddyfile(tools: ToolItem[]): string {
-  const seenSubpaths = new Set<string>();
-  const blocks = tools
-    .filter((t) => {
-      const cleanSub = t.subpath.startsWith('/')
-        ? t.subpath.replace(/\/+$/, '')
-        : `/${t.subpath.replace(/\/+$/, '')}`;
-      if (!cleanSub || seenSubpaths.has(cleanSub)) return false;
-      seenSubpaths.add(cleanSub);
-      return true;
-    })
-    .map((t) => {
-      const cleanSub = t.subpath.startsWith('/')
-        ? t.subpath.replace(/\/+$/, '')
-        : `/${t.subpath.replace(/\/+$/, '')}`;
-      return `    # Outil : ${t.name} (${cleanSub} -> 127.0.0.1:${t.port})
-    redir ${cleanSub} ${cleanSub}/
-    handle_path ${cleanSub}/* {
-        reverse_proxy 127.0.0.1:${t.port}
-    }`;
-    })
-    .join('\n\n');
-
-  return `atelierconceptionjeu.fr, www.atelierconceptionjeu.fr {
-${blocks}
-
-    # Portail Maître Orchestrateur (Racine / -> 127.0.0.1:3000)
-    handle {
-        reverse_proxy 127.0.0.1:3000
-    }
-}
-`;
-}
-
 function syncCaddyConfig(log?: (msg: string) => void) {
   if (!isOracleVm) return;
-  try {
-    const caddyContent = generateCaddyfile(toolsState);
-    fs.writeFileSync('/tmp/Caddyfile.sync', caddyContent, 'utf-8');
-    execSync(
-      `sudo tee /etc/caddy/Caddyfile < /tmp/Caddyfile.sync > /dev/null && sudo chown root:root /etc/caddy/Caddyfile && sudo chmod 644 /etc/caddy/Caddyfile && (sudo restorecon -F /etc/caddy/Caddyfile || true) && (sudo systemctl reload caddy || sudo systemctl restart caddy)`
-    );
-    if (log) {
-      log(`Configuration Caddy (/etc/caddy/Caddyfile) synchronisée et rechargée.`);
-    }
-  } catch (err: any) {
-    if (log) {
-      log(
-        `Note Caddy : utilisation du reverse-proxy interne du Portail (port 3000) en secours (${err.message}).`
-      );
-    }
-  }
+  const directory=fs.mkdtempSync('/tmp/atelier-caddy-review-');
+  const target=path.join(directory,'Caddyfile');
+  fs.writeFileSync(target,generateCaddyfile(toolsState),{mode:0o600});
+  log?.(`Caddyfile protégé préparé dans ${target} ; validation et activation manuelles requises. Configuration active inchangée.`);
 }
 
 function generateSystemdUnitFile(tool: ToolItem): string {
+  if(isAmazonia(tool)) return amazoniaUnit(tool,amazoniaRuntime().node);
   return `[Unit]
 Description=${tool.name} - Atelier Conception Jeu
 After=network.target
@@ -579,6 +540,26 @@ function autoDetectBuildAndStartService(
   autoSubpathPatch: boolean,
   log: (msg: string) => void
 ) {
+  validateTool(tool);
+  if (isAmazonia(tool)) {
+    const {node} = amazoniaRuntime();
+    if(!fs.existsSync(path.join(tool.vmPath,'server.ts')) || !fs.existsSync(path.join(tool.vmPath,'package.json'))) throw new Error('Backend Amazonia requis');
+    const nodeDir=path.dirname(node);
+    runCmdWithDetails(`cd "${tool.vmPath}" && PATH="${nodeDir}:$PATH" npm install --include=dev --legacy-peer-deps && PATH="${nodeDir}:$PATH" npm run build`, log);
+    tool.stackPreset='node';
+    tool.execStart=`${node} --import tsx server.ts`;
+    const unit=generateSystemdUnitFile(tool);
+    const temporary=fs.mkdtempSync('/tmp/amazonia-unit-');
+    try {
+      fs.writeFileSync(path.join(temporary,'unit'),unit,{mode:0o600});
+      runCmdWithDetails(`sudo install -m 644 "${temporary}/unit" /etc/systemd/system/${tool.systemdUnit} && sudo systemctl daemon-reload && sudo systemctl enable ${tool.systemdUnit} && sudo systemctl restart ${tool.systemdUnit}`,log);
+    } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+    // Do not patch sources, compile workers heuristically, kill a port or downgrade to static.
+    tool.status=isPortListening(tool.port)?'active':'stopped';
+    if(tool.status!=='active') throw new Error('Backend Amazonia non démarré');
+    syncCaddyConfig(log); saveToolsRegistry(toolsState); return;
+  }
+
   ensureSrvJeuPermissions();
   const cleanSub = tool.subpath.replace(/\/+$/, '');
   const pkgJsonPath = path.join(tool.vmPath, 'package.json');
@@ -786,60 +767,14 @@ function autoDetectBuildAndStartService(
   }
 }
 
-/**
- * On Portal startup on the Oracle VM, automatically sync Caddyfile and repair any newly registered
- * tool whose directory was blocked by /srv/jeu permissions or whose Node backend was downgraded to http.server.
- */
-function autoHealToolsOnStartup() {
-  if (!isOracleVm) return;
-  setTimeout(() => {
-    try {
-      ensureSrvJeuPermissions();
-      syncCaddyConfig();
-      for (const tool of toolsState) {
-        if (tool.id === 'bga-studio' && tool.commitHash === 'initial') continue;
-        const missingRepo =
-          !fs.existsSync(tool.vmPath) ||
-          (!fs.existsSync(path.join(tool.vmPath, 'package.json')) &&
-            !fs.existsSync(path.join(tool.vmPath, 'app.py')) &&
-            !fs.existsSync(path.join(tool.vmPath, 'index.html')));
-
-        const hasNodeServerTs = fs.existsSync(path.join(tool.vmPath, 'server.ts'));
-        const stuckOnPythonStatic =
-          hasNodeServerTs && tool.execStart.includes('http.server');
-
-        if (
-          missingRepo ||
-          stuckOnPythonStatic ||
-          (tool.status === 'active' && !isPortListening(tool.port))
-        ) {
-          const log = (msg: string) => {
-            tool.logs.push(`[${nowTime()}] [Auto-Repair] ${msg}`);
-          };
-          try {
-            if (missingRepo && tool.repo) {
-              const rev = cloneOrUpdateGitRepo(tool.repo, tool.branch, tool.vmPath, log);
-              tool.commitHash = rev;
-            }
-            autoDetectBuildAndStartService(tool, true, log);
-            saveToolsRegistry(toolsState);
-          } catch (e: any) {
-            log(`Échec auto-repair : ${e.message}`);
-            saveToolsRegistry(toolsState);
-          }
-        }
-      }
-    } catch {
-      // ignore startup background errors
-    }
-  }, 1500);
-}
-
-async function startServer() {
+export async function createPortalApp(tools?: ToolItem[], web=true) {
+  if (tools) toolsState = structuredClone(tools);
+  for (const tool of toolsState) validateTool(tool);
   const app = express();
-  const PORT = 3000;
+  app.disable("x-powered-by");
+  app.use(internalGuard());
 
-  app.use(express.json({ limit: '100mb' }));
+  app.use(express.json({ limit: '256kb' }));
 
   // 1. GET /api/overview
   app.get('/api/overview', (_req, res) => {
@@ -878,6 +813,7 @@ async function startServer() {
   app.post('/api/tools/:id/action', (req, res) => {
     const { id } = req.params;
     const { action } = req.body || {};
+    if (!actions.has(action)) {res.status(400).json({error:'Action non autorisée'});return;}
     const toolIdx = toolsState.findIndex((t) => t.id === id);
     if (toolIdx === -1) {
       res.status(404).json({ error: 'Outil introuvable' });
@@ -885,6 +821,7 @@ async function startServer() {
     }
 
     const tool = toolsState[toolIdx];
+    try { validateTool(tool); } catch {res.status(400).json({error:'Outil invalide'});return;}
     const ts = nowTime();
 
     if (action === 'delete') {
@@ -1033,12 +970,14 @@ async function startServer() {
   app.post('/api/tools/:id/deploy-version', (req, res) => {
     const { id } = req.params;
     const body = (req.body || {}) as DeployVersionRequest;
+    if(body.source!=='git') {res.status(409).json({error:'ZIP désactivé : préparation manuelle en staging requise'});return;}
     const tool = toolsState.find((t) => t.id === id);
     if (!tool) {
       res.status(404).json({ error: 'Outil introuvable' });
       return;
     }
 
+    try {validateTool(tool);} catch {res.status(400).json({error:'Outil invalide'});return;}
     const ts = nowTime();
     const stepLogs: string[] = [];
     const log = (msg: string) => {
@@ -1067,96 +1006,6 @@ async function startServer() {
         }
         tool.lastSource = 'git';
         tool.lastUpdated = `Mis à jour depuis Git (${ts})`;
-      } else if (body.source === 'zip') {
-        if (!body.zipBase64) {
-          res.status(400).json({ error: 'Aucune archive ZIP fournie.' });
-          return;
-        }
-        const commitMsg =
-          (body.commitMessage || '').trim() ||
-          `feat: déploiement archive Gemini (${body.zipFileName || 'update.zip'})`;
-
-        log(
-          `Réception de l'archive Gemini : ${body.zipFileName || 'archive.zip'}...`
-        );
-
-        if (isOracleVm) {
-          ensureSrvJeuPermissions();
-          const tmpZip = `/tmp/gemini_${tool.id}_${Date.now()}.zip`;
-          const tmpExtract = `/tmp/gemini_extract_${tool.id}_${Date.now()}`;
-          fs.writeFileSync(tmpZip, Buffer.from(body.zipBase64, 'base64'));
-          fs.mkdirSync(tmpExtract, { recursive: true });
-
-          runCmdWithDetails(`unzip -q -o "${tmpZip}" -d "${tmpExtract}"`, log);
-          log(`Archive décompressée dans ${tmpExtract}.`);
-
-          const entries = fs.readdirSync(tmpExtract);
-          let sourceRoot = tmpExtract;
-          if (
-            entries.length === 1 &&
-            fs.statSync(path.join(tmpExtract, entries[0])).isDirectory()
-          ) {
-            sourceRoot = path.join(tmpExtract, entries[0]);
-          }
-
-          execSync(
-            `sudo mkdir -p "${tool.vmPath}" && sudo chown -R opc:opc "${tool.vmPath}"`
-          );
-          runCmdWithDetails(
-            `rsync -a --delete --exclude='.git' --exclude='venv' --exclude='node_modules' --exclude='dist' --exclude='data' --exclude='outputs' --exclude='dataset' --exclude='originals' --exclude='models' --exclude='.gemini_key' "${sourceRoot}/" "${tool.vmPath}/"`,
-            log
-          );
-          log(
-            `Fichiers synchronisés dans ${tool.vmPath} (données et .git préservés).`
-          );
-
-          autoDetectBuildAndStartService(tool, Boolean(body.autoSubpathPatch), log);
-
-          try {
-            if (!fs.existsSync(path.join(tool.vmPath, '.git'))) {
-              execSync(
-                `cd "${tool.vmPath}" && git init -b ${tool.branch} && git remote add origin git@github.com:${tool.repo}.git`
-              );
-            }
-            execSync(
-              `cd "${tool.vmPath}" && git config user.name "Atelier Portail VM" && git config user.email "opc@atelierconceptionjeu.fr"`
-            );
-            execSync(`cd "${tool.vmPath}" && git add -A`);
-            const statusOut = execSync(
-              `cd "${tool.vmPath}" && git status --porcelain`,
-              { encoding: 'utf-8' }
-            ).trim();
-            if (statusOut) {
-              execSync(
-                `cd "${tool.vmPath}" && git commit -m ${JSON.stringify(commitMsg)}`
-              );
-              const rev = execSync(
-                `cd "${tool.vmPath}" && git rev-parse --short HEAD`,
-                { encoding: 'utf-8' }
-              ).trim();
-              tool.commitHash = rev || tool.commitHash;
-              log(`Commit Git créé sur la VM (${tool.commitHash}). Envoi vers GitHub...`);
-              execSync(`cd "${tool.vmPath}" && git push -u origin ${tool.branch}`);
-              log(`Synchronisation GitHub (${tool.repo}) réussie !`);
-            } else {
-              log(`Aucun changement de code à commiter vers GitHub.`);
-            }
-          } catch {
-            log(
-              `Note Git Push : L'outil est bien déployé et actif sur la VM, mais le push vers GitHub nécessite d'autoriser la clé SSH de la VM (voir onglet Guide & Prérequis).`
-            );
-          }
-
-          fs.rmSync(tmpZip, { force: true });
-          fs.rmSync(tmpExtract, { recursive: true, force: true });
-        } else {
-          log(`[Aperçu] Extraction de ${body.zipFileName} vers ${tool.vmPath}`);
-          log(`[Aperçu] Auto-détection stack & redémarrage ${tool.systemdUnit}`);
-          log(`[Aperçu] git commit -m "${commitMsg}" && git push origin ${tool.branch}`);
-          tool.status = 'active';
-        }
-        tool.lastSource = 'zip';
-        tool.lastUpdated = `Déployé par ZIP (${ts})`;
       }
 
       saveToolsRegistry(toolsState);
@@ -1171,6 +1020,8 @@ async function startServer() {
   // 4. POST /api/tools/create
   app.post('/api/tools/create', (req, res) => {
     const body = (req.body || {}) as CreateToolRequest;
+    if(body.initialSource!=='git' || body.stackPreset==='custom') {res.status(409).json({error:'Création Git avec recette détectée uniquement'});return;}
+    if(typeof body.id!=='string'||! /^[a-z0-9][a-z0-9-]{0,63}$/.test(body.id)||typeof body.name!=='string'||typeof body.repo!=='string'||typeof body.subpath!=='string') {res.status(400).json({error:'Champs invalides'});return;}
     const cleanId = (body.id || '')
       .toLowerCase()
       .replace(/[^a-z0-9-]/g, '-')
@@ -1210,8 +1061,8 @@ async function startServer() {
       systemdUnit,
       vmPath,
       stackPreset: body.stackPreset,
-      execStart: body.execStart.trim(),
-      buildCmd: (body.buildCmd || '').trim(),
+      execStart: '', // HTTP cannot select a shell command. Stack detection owns this recipe.
+      buildCmd: '',
       status: 'active',
       logs: [`[${nowTime()}] Création de l'outil ${body.name} sur ${cleanSubpath} (port ${body.port}).`],
     };
@@ -1223,6 +1074,8 @@ async function startServer() {
       newTool.logs.push(entry);
     };
 
+    try { validateTool(newTool); } catch {res.status(400).json({error:'Configuration invalide'});return;}
+    if(toolsState.some(t=>t.port===newTool.port||t.subpath===newTool.subpath||t.vmPath===newTool.vmPath)) {res.status(400).json({error:'Collision outil'});return;}
     toolsState.push(newTool);
     saveToolsRegistry(toolsState);
 
@@ -1232,44 +1085,6 @@ async function startServer() {
         if (body.initialSource === 'git') {
           const rev = cloneOrUpdateGitRepo(newTool.repo, newTool.branch, vmPath, log);
           newTool.commitHash = rev;
-        } else if (body.initialSource === 'zip' && body.zipBase64) {
-          log(`Extraction de l'archive initiale ${body.zipFileName || 'archive.zip'}...`);
-          const tmpZip = `/tmp/new_${cleanId}_${Date.now()}.zip`;
-          const tmpExtract = `/tmp/new_extract_${cleanId}_${Date.now()}`;
-          fs.writeFileSync(tmpZip, Buffer.from(body.zipBase64, 'base64'));
-          fs.mkdirSync(tmpExtract, { recursive: true });
-          runCmdWithDetails(`unzip -q -o "${tmpZip}" -d "${tmpExtract}"`, log);
-
-          const entries = fs.readdirSync(tmpExtract);
-          let sourceRoot = tmpExtract;
-          if (
-            entries.length === 1 &&
-            fs.statSync(path.join(tmpExtract, entries[0])).isDirectory()
-          ) {
-            sourceRoot = path.join(tmpExtract, entries[0]);
-          }
-          execSync(`sudo mkdir -p "${vmPath}" && sudo chown -R opc:opc "${vmPath}"`);
-          execSync(`cp -r "${sourceRoot}/." "${vmPath}/"`);
-          fs.rmSync(tmpZip, { force: true });
-          fs.rmSync(tmpExtract, { recursive: true, force: true });
-
-          try {
-            execSync(
-              `cd "${vmPath}" && git init -b main && git config user.name "Atelier Portail VM" && git config user.email "opc@atelierconceptionjeu.fr" && git add -A && git commit -m "feat: version initiale depuis archive Gemini"`
-            );
-            newTool.commitHash = execSync(
-              `cd "${vmPath}" && git rev-parse --short HEAD`,
-              { encoding: 'utf-8' }
-            ).trim();
-            execSync(
-              `cd "${vmPath}" && git remote add origin git@github.com:${newTool.repo}.git && git push -u origin main`
-            );
-            log(`Dépôt Git initialisé et poussé vers github.com/${newTool.repo}.`);
-          } catch {
-            log(`Dépôt Git local initialisé dans ${vmPath}.`);
-          }
-        } else {
-          execSync(`sudo mkdir -p "${vmPath}" && sudo chown -R opc:opc "${vmPath}"`);
         }
 
         autoDetectBuildAndStartService(newTool, Boolean(body.autoSubpathPatch), log);
@@ -1277,7 +1092,7 @@ async function startServer() {
       } else {
         log(`[Aperçu] Dossier ${vmPath} préparé.`);
         log(`[Aperçu] Service /etc/systemd/system/${systemdUnit} activé sur le port ${newTool.port}.`);
-        log(`[Aperçu] Route Caddy ${cleanSubpath}/* ajoutée et Caddy rechargé.`);
+        log(`[Aperçu] Route Caddy ${cleanSubpath}/* à préparer et activer manuellement.`);
         saveToolsRegistry(toolsState);
       }
 
@@ -1329,8 +1144,7 @@ async function startServer() {
     }
   });
 
-  // 6. Built-in Subpath & Referer-Aware API Reverse-Proxy
-  // Routes both /<subpath>/* AND any root /api/* call coming from a tool page (e.g. /api/health, /api/campaigns) to the right tool port!
+  // 6. Explicit subpath proxy only. The authenticated entry is mandatory; no Referer fallback.
   app.use((req, res, next) => {
     let matchedTool = toolsState.find((t) => {
       const cleanSub = t.subpath.replace(/\/+$/, '');
@@ -1347,21 +1161,6 @@ async function startServer() {
         return;
       }
       targetPath = req.originalUrl.slice(cleanSub.length) || '/';
-    } else if (
-      req.path.startsWith('/api/') &&
-      !req.path.startsWith('/api/overview') &&
-      !req.path.startsWith('/api/tools') &&
-      !req.path.startsWith('/api/portal')
-    ) {
-      const referer = String(req.headers.referer || '');
-      matchedTool =
-        toolsState.find((t) => {
-          const cleanSub = t.subpath.replace(/\/+$/, '');
-          return cleanSub && referer.includes(`${cleanSub}`);
-        }) ||
-        toolsState.find((t) => t.id === 'amazonia') ||
-        toolsState.find((t) => t.stackPreset === 'node' && t.status === 'active');
-      targetPath = req.originalUrl;
     }
 
     if (!matchedTool) {
@@ -1379,7 +1178,7 @@ async function startServer() {
         path: strippedUrl,
         method: req.method,
         headers: {
-          ...req.headers,
+          ...proxyHeaders(req.headers, isAmazonia(matchedTool)),
           host: `127.0.0.1:${matchedTool.port}`,
           'x-forwarded-prefix': cleanSub,
         },
@@ -1458,6 +1257,8 @@ async function startServer() {
     }
   });
 
+  app.use((err: any, _req: any, res: any, _next: any) => res.status(err.type==='entity.too.large'?413:400).json({error:'Requête invalide'}));
+  if (!web) return app;
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1472,12 +1273,13 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `Atelier Conception Jeu — Portail Orchestrateur actif sur http://0.0.0.0:${PORT}`
-    );
-    autoHealToolsOnStartup();
-  });
+  app.use((err: any, _req: any, res: any, _next: any) => res.status(err.type==='entity.too.large'?413:400).json({error:'Requête invalide'}));
+  return app;
 }
-
-startServer();
+async function startServer() {
+  toolsState = loadToolsRegistry();
+  const app = await createPortalApp();
+  app.listen(3000, '127.0.0.1', () => console.log('Portail actif sur loopback:3000'));
+  // No automatic deployments or Caddy rewrites on startup.
+}
+if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) void startServer();
