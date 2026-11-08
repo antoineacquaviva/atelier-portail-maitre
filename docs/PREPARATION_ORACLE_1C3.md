@@ -73,6 +73,18 @@ Ne jamais accorder sudo permanent/général à ces scripts ou comptes. Le helper
 
 ## Reprise et conditions d'arrêt
 
+### Correctif 1C.3.1 — résolution des commandes Oracle Linux
+
+Le premier contrôle Oracle s'arrêtait avant création du workspace : `getenforce`, présent dans `/usr/sbin`, n'était pas accessible dans le PATH contrôlé. Le dispositif utilise désormais la liste fixe `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`, jamais le PATH utilisateur. Le seul préfixe supplémentaire reste le `bin` du Node préparé pour les commandes qui en ont besoin ; aucun PATH global n'est modifié.
+
+L'audit des deux scripts confirme : `id`, `getenforce`, `systemctl`, `git` et `sudo` passent par cet environnement fixe ; les vérifications `which` de Python/Git/tar utilisent la même liste. L'appel sudo reçoit maintenant lui aussi `safe_env()` au lieu d'hériter l'environnement utilisateur. Python du helper (`/usr/bin/python3`), Node/Caddy actifs (`/usr/bin/node`, `/usr/bin/caddy`), Node préparé, `/usr/sbin/useradd`, `/usr/sbin/runuser` et `/sbin/nologin` restent des chemins explicites. `useradd` et le Node lancé par `runuser` reçoivent également un PATH contrôlé. Les commandes npm et les outils TypeScript sont lancés par le Node absolu sélectionné. Aucun autre repli vers une commande utilisateur ou SSH n'est ajouté.
+
+Les nouveaux tests reproduisent l'échec avec un PATH limité à bin, puis exécutent un faux `getenforce` situé uniquement dans une arborescence temporaire `usr/sbin`, malgré un PATH utilisateur hostile. Le parcours de contrôles Oracle simulé termine sans créer de workspace ; un prérequis disponible uniquement dans le PATH utilisateur est refusé. Les lancements sudo/useradd sont contrôlés avec des doubles de test, sans opération privilégiée réelle. Les garanties d'écriture, les empreintes de reprise et les restrictions P restent identiques. Comme aucun workspace n'a été créé lors de l'échec Oracle signalé, il suffit, après revue de ce correctif, de transférer les deux scripts Python correspondants et de relancer les contrôles avec la fiche existante ; ne pas contourner le contrôle des empreintes si un autre workspace existe déjà.
+
+Validation locale 1C.3.1 : cinq nouveaux tests de résolution, les 20 tests Python existants (dont le lancement sudo étendu), quatre tests Unix en conteneur jetable et sept groupes PowerShell. La restauration Amazonia réelle reste testée sur fixtures au commit ciblé ; le transport SSH PowerShell reste simulé. Aucun test ne contacte Oracle. Les effectifs effectivement réussis sont également consignés dans la PR dédiée ; la branche NTFS/Windows et la validation Oracle réelle restent à effectuer par le propriétaire après revue.
+
+### Règles de reprise inchangées
+
 - Relancer **la même commande et la même fiche**. Les inputs (sauvegardes, historique, registre), versions du dispositif et produits de chaque étape sont revérifiés ; un marqueur de succès seul ne suffit pas. Les produits de restauration sont eux-mêmes hachés. Un changement de fiche/code/input ou d'artefact fini impose revue et nouvelle préparation, pas écrasement.
 - Un transfert Node interrompu et une extraction/clone incomplets sont conservés dans des tentatives distinctes. Les étapes réussies ne sont pas refaites ; un npm interrompu est réexécuté uniquement dans sa copie possédée. Les essais de restauration incomplets restent dans restore-N et l'essai suivant utilise N+1. Aucun nettoyage automatique ni `git reset --hard`.
 - Un Node **publié** existant, sous `/opt` ou dans le runtime préparé, doit correspondre intégralement à l'archive : liste exacte, octets de tous les fichiers, types, cibles des liens internes, absence de liens physiques inexpliqués, propriétaires et modes exacts (dossiers 0755, fichiers 0644/0755). Sous `/opt`, UID/GID root sont exigés. Un fichier manquant, supplémentaire, un propriétaire/mode erroné ou un lien altéré arrête la préparation **sans écriture dans cette cible**. La publication utilise renameat2/RENAME_NOREPLACE ; même une destination vide déjà créée est refusée.
@@ -101,6 +113,7 @@ Comparer les SHA après transfert détecte une corruption, pas une signature ind
 Commandes locales de tests, sans Oracle :
 
 ```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/documentation -p test_oracle_path.py -v
 PYTHONDONTWRITEBYTECODE=1 AMAZONIA_FIXTURE_ROOT=/workspace/Amazonia TSX_FIXTURE_PACKAGE=/tmp/amazonia-1c2-doc-test-deps/node_modules/tsx python3 -m unittest discover -s tests/documentation -p test_oracle_prepare.py -v
 pwsh -NoLogo -NoProfile -File tests/documentation/OraclePreparation.Tests.ps1
 ```

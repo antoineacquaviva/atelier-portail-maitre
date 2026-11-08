@@ -25,6 +25,9 @@ HISTORY = Path('/home/opc/amazonia-data-backup-20261108-125739')
 REGISTRY = Path('/srv/jeu/tools-registry.json')
 NAMES = ('applications.tar', 'configurations.tar', 'registre.json')
 ROUTES = {'/lora': 5050, '/lab': 8080, '/bga': 8082, '/amazonia': 8083}
+# Oracle Linux places administrative commands (notably getenforce) in sbin.
+# This list is fixed; the caller's PATH is never appended or inherited.
+SYSTEM_PATH = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 
 
 class Stop(Exception):
@@ -336,7 +339,7 @@ def safe_env(node_dir=None):
     keys = ('HOME', 'USER', 'LANG', 'LC_ALL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
             'http_proxy', 'https_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS')
     e = {k: os.environ[k] for k in keys if k in os.environ}
-    e['PATH'] = (str(node_dir) + ':' if node_dir else '') + '/usr/local/bin:/usr/bin:/bin'
+    e['PATH'] = (str(node_dir) + ':' if node_dir else '') + SYSTEM_PATH
     e['GIT_TERMINAL_PROMPT'] = '0'
     e['GIT_CONFIG_NOSYSTEM'] = '1'
     e['GIT_CONFIG_GLOBAL'] = '/dev/null'
@@ -422,7 +425,7 @@ class Preparation:
                 need(command(['systemctl', 'is-active', unit]).strip() == 'active', 'SERVICE_STATE')
             self.active_snapshot = self.active()
         for tool in ('python3', 'git', 'tar'):
-            need(shutil.which(tool), 'PREREQUISITE_MISSING')
+            need(shutil.which(tool, path=SYSTEM_PATH), 'PREREQUISITE_MISSING')
         private(self.backup)
         private(self.history)
         canonical(self.root.parent)
@@ -757,7 +760,8 @@ WantedBy=multi-user.target
                 if provision:
                     helper = Path(__file__).with_name('oracle_provision.py')
                     p = subprocess.run(['sudo', '/usr/bin/python3', str(helper), '--workspace', str(self.root),
-                                        '--version', self.c['node_version'], '--sha256', self.c['node_sha256']])
+                                        '--version', self.c['node_version'], '--sha256', self.c['node_sha256']],
+                                       env=safe_env())
                     need(p.returncode == 0, 'PROVISION_FAILED')
                 need(self.inputs() == self.initial, 'INPUTS_CHANGED_DURING_PREPARATION')
                 if self.active_snapshot is not None:
