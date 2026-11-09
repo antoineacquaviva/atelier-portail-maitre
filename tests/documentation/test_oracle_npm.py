@@ -55,7 +55,12 @@ class NpmEnvironment(unittest.TestCase):
                     before = path.lstat()
                     with self.assertRaises(p.Stop):
                         self.prep.npm_env()
-                    self.assertEqual(before, path.lstat())
+                    # Reading a rejected nonempty config may update atime under
+                    # relatime. Check actual mutations, not the read timestamp.
+                    after = path.lstat()
+                    for field in ('st_mode', 'st_ino', 'st_dev', 'st_nlink', 'st_uid',
+                                  'st_gid', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+                        self.assertEqual(getattr(before, field), getattr(after, field), field)
                     path.unlink()
                     if alteration == 'hardlink':
                         (self.root / 'hardlink').unlink()

@@ -1,5 +1,11 @@
 # Mission 1C.3 — préparation automatique, sans déploiement
 
+> **P réussie le 9 novembre 2026, bilan du propriétaire :** code 0, P_ONLY,
+> success=true, ready_for_deployment=false, cinq étapes réussies. Pour cette
+> opération, suivre [la suite post-P](APRES_P_ORACLE.md), sans relancer P, modifier
+> ses marqueurs/scripts/exports ni ajouter `--provision-approved` à sa reprise.
+> Les procédures de tentative/reprise ci-dessous sont historiques pour ce workspace.
+
 **Livraison de scripts pour revue. Aucun de ces scripts n'a été exécuté sur Oracle par Codex.** Le [plan 1C.2 fusionné](DEPLOIEMENT_ORACLE_1C2.md) reste la référence pour B/R et le retour arrière. Cette mission prépare seulement P. La fusion d'une PR n'autorise pas son exécution.
 
 Le complément 1C.3 du propriétaire précise que SELinux est Enforcing, Caddy est en 2.11.7, le registre réel contient quatre outils, et BGA est un projet futur vide, sans service. Ces informations remplacent pour cette préparation les inconnues correspondantes de 1C.2 : **conserver BGA, ne pas exiger sa santé, ne pas créer/démarrer son unité**. LoRA/Forêt/Amazonia/portail doivent rester actifs. Les ports 3000/5050 ouverts et les écoutes globales sont signalés comme travaux futurs B, jamais modifiés en P.

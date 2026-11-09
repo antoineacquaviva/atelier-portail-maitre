@@ -1,5 +1,10 @@
 # Mission 1C.3.4 — reprise groupée de P, sans déploiement
 
+> **Mise à jour du 9 novembre 2026 : cette tentative P a réussi selon le
+> propriétaire.** Les instructions de nouvelle tentative ci-dessous sont
+> historiques pour cette opération. Conserver toutes ses références et suivre
+> [le parcours post-P](APRES_P_ORACLE.md), sans relancer/modifier P ni son export.
+
 Cette livraison corrige les obstacles logiciels connus. Aucune commande n'a été
 exécutée sur Oracle. Les résultats locaux ne valident ni l'état de la VM, ni une
 bascule. Les procédures B/R de 1C.2 restent hors de cette intervention.
