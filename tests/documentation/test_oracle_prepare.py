@@ -140,6 +140,42 @@ class Fixtures(unittest.TestCase):
         with self.assertRaisesRegex(p.Stop, 'STEP_OUTPUT_CHANGED'):
             again.step('first', ['first.txt'], lambda: None)
 
+    def test_amazonia_sync_requires_fresh_workspace_and_preserves_old_one(self):
+        self.assertEqual(p.AMAZONIA, 'e81bcf2076972b7617f6202d2bbfe94314144c17')
+        self.assertEqual(p.PORTAL, 'f62ef8148cdf18873272a169b48195443b532ce8')
+        # Reconstruct the previous script identity: only the Amazonia pin changed.
+        source = (SCRIPTS / 'oracle_prepare.py').read_bytes()
+        old_source = source.replace(p.AMAZONIA.encode(),
+                                    b'efdb787ad3edad845dfc60c6124f6bca2cd4dd6e')
+        old_identity = hashlib.sha256(old_source).hexdigest() + p.sha(SCRIPTS / 'oracle_provision.py')
+        self.assertNotEqual(old_identity, self.prep.state['implementation'])
+        original_sha = p.sha
+        def previous_sha(path):
+            if Path(path) == SCRIPTS / 'oracle_prepare.py':
+                return hashlib.sha256(old_source).hexdigest()
+            return original_sha(path)
+        with patch.object(p, 'sha', side_effect=previous_sha):
+            previous = p.Preparation(self.c, self.backup, self.history, self.registry)
+        previous.initial = previous.inputs()
+        previous.open()
+        with patch.object(p, 'disk_check'):
+            previous.step('node', ['runtime'], lambda: (previous.root / 'runtime').mkdir())
+        before = snapshot(previous.root)
+        self.prep.initial = self.prep.inputs()
+        with self.assertRaisesRegex(p.Stop, '^WORKSPACE_INCOMPATIBLE$'):
+            self.prep.run()
+        self.assertEqual(snapshot(previous.root), before)
+        config = dict(self.c, workspace=str(self.base / 'preparation-new'))
+        fresh = p.Preparation(config, self.backup, self.history, self.registry)
+        with patch.object(p, 'disk_check'):
+            fresh.checks(oracle=False)
+        self.assertFalse(fresh.root.exists())
+        fresh.open()
+        fresh.npm_env()
+        self.assertEqual(snapshot(previous.root), before)
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        self.assertEqual(snapshot(self.history), self.initial_history)
+
     def test_interrupted_state_publication_and_lock_source_changes(self):
         prep = self.opened()
         p.write_new(prep.root / 'state.json.next', 'interrupted write')
@@ -431,6 +467,11 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(calls.count('node'), 1)
         self.assertEqual(calls.count('amazonia.next'), 1)
         self.assertEqual(calls.count('portail.next'), 2)
+        self.assertEqual((prep.root / 'amazonia.next/commit').read_text(), p.AMAZONIA)
+        self.assertEqual((prep.root / 'portail.next/commit').read_text(), p.PORTAL)
+        report = json.loads((prep.root / 'report.json').read_text())
+        self.assertEqual(report['commits'], {'amazonia': p.AMAZONIA, 'portal': p.PORTAL})
+        self.assertFalse(report['ready_for_deployment'])
         self.assertEqual(p.sha(prep.root / 'registry.copy.json'), p.sha(self.registry))
         self.assertEqual(snapshot(self.backup), self.initial_backup)
         self.assertEqual(snapshot(self.history), self.initial_history)
