@@ -83,6 +83,25 @@ Les nouveaux tests reproduisent l'échec avec un PATH limité à bin, puis exéc
 
 Validation locale 1C.3.1 : cinq nouveaux tests de résolution, les 20 tests Python existants (dont le lancement sudo étendu), quatre tests Unix en conteneur jetable et sept groupes PowerShell. La restauration Amazonia réelle reste testée sur fixtures au commit ciblé ; le transport SSH PowerShell reste simulé. Aucun test ne contacte Oracle. Les effectifs effectivement réussis sont également consignés dans la PR dédiée ; la branche NTFS/Windows et la validation Oracle réelle restent à effectuer par le propriétaire après revue.
 
+### Correctif 1C.3.2 — lancement npm 11 et workspace déjà commencé
+
+Avec Node 24.22.1/npm 11.19.1, désigner `/dev/null` à la fois comme `userconfig` et `globalconfig` provoque `Exit prior to config file resolving` / `double-loading config`. L'environnement npm utilise désormais deux fichiers **distincts et vides**, `npm-config/user.npmrc` et `npm-config/global.npmrc`, dans le workspace 0700. Ils sont créés exclusivement en 0600 ; à chaque utilisation, liens symboliques/physiques, contenu non vide, propriétaire ou permissions inattendus sont refusés, sans réparation. Les variables npm du processus appelant sont filtrées ; les `.npmrc` personnels et globaux ne sont pas hérités. Les éventuels `.npmrc` des copies de dépôts de confiance restent soumis au fonctionnement normal de npm.
+
+Le même environnement couvre les deux releases : `install --include=dev`, `run lint`, `run test`, `run build` (bases `/amazonia/` et `/`) et `ls --all --json`. Le Node et le CLI npm restent absolus ; PATH, politique peer-deps, sauvegardes, empreintes et verrou ne changent pas.
+
+**Le workspace `/home/opc/atelier-preparation-1c3-20261108-01` ne peut pas reprendre avec ce correctif.** Son étape `node` est réussie et `amazonia` s'est arrêtée sur `NPM_INSTALL_FAILED`, mais son identité inclut le SHA-256 de chacun des deux scripts Python. La nouvelle version de `oracle_prepare.py` entraîne donc `WORKSPACE_INCOMPATIBLE` avant verrou, étape ou réécriture de rapport. Un échec npm est normalement reprenable dans sa copie possédée avec les **mêmes scripts**, fiche et inputs ; conserver l'ancien script ne résout toutefois pas cette erreur npm. Les contrôles seuls (`sans --prepare`) ne vérifient pas l'ouverture du workspace et ne prouvent pas qu'une reprise serait compatible.
+
+Procédure pour le propriétaire, **après revue du correctif et accord P**, jamais exécutée par Codex sur Oracle :
+
+1. Conserver intégralement l'ancien workspace, ses marqueurs, son état, le runtime Node, les copies partielles, les exports et le `npm-diagnostic.log` privé. Ne pas publier ce journal. Ne modifier ni `owner.json`, ni `state.json`, ni l'empreinte des scripts pour forcer une reprise ; ne pas effacer/renommer le workspace pour réutiliser son nom.
+2. Transférer les scripts relus correspondants dans un **nouveau dossier personnel de scripts**, en conservant l'ancienne version pour traçabilité. Ne pas mettre à jour le portail installé.
+3. Créer une nouvelle fiche, avec un nouveau chemin libre `/home/opc/atelier-preparation-1c3-IDENTIFIANT-NOUVEAU`. Garder la version Node, le SHA officiel approuvé et la politique npm approuvée ; ne pas inventer de checksum ni changer peer-deps implicitement. Prévoir l'espace pour les deux workspaces conservés. Les sauvegardes historiques et complémentaires existantes restent les sources en lecture seule.
+4. Lancer d'abord les contrôles avec cette nouvelle fiche, puis, après accord P, la préparation avec `--prepare` selon les commandes ci-dessus. Toutes les étapes sont préparées dans ce nouveau workspace, y compris Node ; ne pas y transplanter de marqueurs ou de résultats de l'ancien. Aucun provisionnement supplémentaire, déploiement ou changement des cinq services actifs n'est autorisé par ce correctif.
+
+Les tests locaux distinguent le vrai lancement de npm 11 (ancienne erreur reproduite, lecture de configuration corrigée, scripts factices et inventaire sans aucune installation de dépendances) des doubles de commandes utilisés pour vérifier tous les appels des deux releases et la reprise après `NPM_INSTALL_FAILED`. Le changement d'empreinte de **chaque** script est testé : refus sans modification du workspace. Ces simulations ne constituent pas un build réel des releases ni une validation Oracle.
+
+Validation Codex 1C.3.2 : **30 tests Python ordinaires réussis**, dont npm **11.19.1 réel avec Node 24.22.1**, restauration Amazonia réelle sur fixtures au SHA ciblé et génération Caddy ; **quatre tests Unix réussis** en conteneur jetable root sans réseau, dépôt en lecture seule ; **sept groupes PowerShell réussis** sous 7.5.4/Linux avec scp simulé. Le portail donne **sept tests réussis et deux ignorés** (recette Caddy/Chromium non configurée), avec des dépendances de test isolées sous `/tmp`. L'installation applicative standard reste bloquée par le conflit peer existant Vite 8.3.6/esbuild 0.25.12 ; aucun `--force`/`--legacy-peer-deps` n'a été ajouté, aucun build complet des releases n'est revendiqué. Syntaxe Python et `git diff --check` réussis. Aucun accès Oracle.
+
 ### Règles de reprise inchangées
 
 - Relancer **la même commande et la même fiche**. Les inputs (sauvegardes, historique, registre), versions du dispositif et produits de chaque étape sont revérifiés ; un marqueur de succès seul ne suffit pas. Les produits de restauration sont eux-mêmes hachés. Un changement de fiche/code/input ou d'artefact fini impose revue et nouvelle préparation, pas écrasement.
@@ -114,9 +133,12 @@ Commandes locales de tests, sans Oracle :
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/documentation -p test_oracle_path.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/documentation -p test_oracle_npm.py -v
 PYTHONDONTWRITEBYTECODE=1 AMAZONIA_FIXTURE_ROOT=/workspace/Amazonia TSX_FIXTURE_PACKAGE=/tmp/amazonia-1c2-doc-test-deps/node_modules/tsx python3 -m unittest discover -s tests/documentation -p test_oracle_prepare.py -v
 pwsh -NoLogo -NoProfile -File tests/documentation/OraclePreparation.Tests.ps1
 ```
+
+Le test npm requiert Node et npm 11 locaux. Facultativement, `NPM11_CLI=/chemin/local/npm/bin/npm-cli.js` sélectionne un CLI npm 11 précis, lancé par le Node absolu disponible ; le test ne télécharge rien. Sans npm 11, ce test réel est explicitement ignoré (un CLI explicitement sélectionné d'une autre version est un échec). Il force le mode hors ligne et désactive le contrôle de mise à jour. Les dépendances nécessaires aux autres suites, si absentes, se préparent séparément dans Codex : elles ne sont jamais installées par ce test.
 
 Les chemins de test sont des exemples locaux du workspace Codex, pas des chemins Oracle. Sans les deux variables de fixture, le test de restauration Amazonia réelle est explicitement ignoré. Les tests PowerShell utilisent un transport de fichiers simulé, jamais SSH. La branche NTFS/Windows, le provisionnement privilégié complet, SELinux/systemd sur Oracle, les téléchargements officiels Node et les builds complets des deux releases restent à vérifier lors de P après accord ; les tests ne les présentent pas comme réalisés. Les tests de reprise de l'orchestrateur simulent les commandes externes de build ; la restauration utilise réellement le gestionnaire et les outils backup/restore du commit ciblé sur 16 fichiers fictifs.
 
