@@ -1,5 +1,12 @@
 # Mission 1C.2 — plan coordonné Amazonia / portail sur Oracle
 
+> **9 novembre 2026 : P a réussi selon le bilan du propriétaire.** Pour cette
+> opération, suivre [le complément post-P](APRES_P_ORACLE.md) : ne pas recommencer
+> la préparation ni changer ses releases/scripts/workspaces/exports. Les constats
+> datés ci-dessous restent historiques ; les mécanismes B/R et rollback restent
+> soumis à leurs prérequis et accords distincts. BGA reste un projet futur, sans
+> création/démarrage de service ni santé à exiger.
+
 **Statut : préparation documentaire seulement, 8 novembre 2026. Aucune commande de ce document n'a été exécutée sur Oracle.**
 
 Livrable à faire relire par ChatGPT et le propriétaire. La fusion de cette PR ne vaut pas autorisation d'intervenir. Toutes les commandes ci-dessous sont des instructions **futures**, à exécuter manuellement après les accords correspondants, une étape à la fois. Ne pas copier le document entier dans un terminal. Une erreur, une différence inexpliquée ou une condition d'arrêt impose de suspendre la procédure ; ne pas poursuivre avec les commandes suivantes.
