@@ -542,9 +542,7 @@ class Preparation:
         need(not cloned.is_symlink() and cloned.read_text() == commit, 'RELEASE_MARKER')
         node = self.root / 'runtime/node/bin/node'
         npm = self.root / 'runtime/node/lib/node_modules/npm/bin/npm-cli.js'
-        e = safe_env(node.parent)
-        e.update(npm_config_cache=str(self.root / 'npm-cache'), npm_config_userconfig='/dev/null',
-                 npm_config_globalconfig='/dev/null', npm_config_audit='false', npm_config_fund='false')
+        e = self.npm_env()
         install = [node, npm, 'install', '--include=dev']
         if self.c.get('npm_legacy_peer_deps', False):
             install.append('--legacy-peer-deps')
@@ -557,6 +555,25 @@ class Preparation:
         if not path.exists():
             write_new(path, dependencies)
         need((dest / 'dist/index.html').is_file() and (dest / 'package-lock.json').is_file(), 'BUILD_ARTIFACTS')
+
+    def npm_env(self):
+        # npm 11 refuses loading one path as both user and global config.
+        # Explicit empty files also exclude personal/global npmrc credentials.
+        private(self.root)
+        configs = owned_dir(self.root / 'npm-config')
+        e = safe_env(self.root / 'runtime/node/bin')
+        for kind in ('user', 'global'):
+            path = canonical(configs / (kind + '.npmrc'), exists=False)
+            if not path.exists():
+                write_new(path, '')
+            s = path.lstat()
+            need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid()
+                 and stat.S_IMODE(s.st_mode) == 0o600 and s.st_nlink == 1
+                 and path.read_bytes() == b'', 'NPM_CONFIG_UNSAFE')
+            e['npm_config_' + kind + 'config'] = str(path)
+        e.update(npm_config_cache=str(self.root / 'npm-cache'),
+                 npm_config_audit='false', npm_config_fund='false')
+        return e
 
     def restore(self):
         """Fresh generation per interrupted attempt. Failed copies kept, never reused."""

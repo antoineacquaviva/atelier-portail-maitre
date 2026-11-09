@@ -149,6 +149,53 @@ class Fixtures(unittest.TestCase):
         with self.assertRaises(p.Stop):
             prep.inputs()
 
+    def test_npm_install_failure_resumes_only_with_identical_scripts(self):
+        prep = self.opened()
+        dest = prep.root / 'amazonia.next'
+        calls = []
+        def launch(args, **kwargs):
+            calls.append(args)
+            if args[0] == 'git':
+                if args[1] == 'clone':
+                    (dest / '.git').mkdir()
+                return p.AMAZONIA
+            if args[2] == 'install' and sum(c[2:3] == ['install'] for c in calls) == 1:
+                p.write_new(dest / 'partial-install', 'preserve')
+                raise p.Stop('COMMAND_FAILED')
+            (dest / 'dist').mkdir(exist_ok=True)
+            (dest / 'dist/index.html').write_text('fixture')
+            (dest / 'package-lock.json').write_text('{}')
+            return '{}'
+        with patch.object(p, 'disk_check'), patch.object(p, 'command', side_effect=launch):
+            prep.step('node', ['runtime'], lambda: (prep.root / 'runtime').mkdir())
+            with self.assertRaisesRegex(p.Stop, '^NPM_INSTALL_FAILED$'):
+                prep.step('amazonia', ['amazonia.next', 'amazonia.next.dependencies.json'],
+                          lambda: prep.clone_build('amazonia.next', p.AMAZONIA))
+            self.assertNotIn('amazonia', json.loads((prep.root / 'state.json').read_text())['steps'])
+            again = p.Preparation(self.c, self.backup, self.history, self.registry)
+            again.initial = again.inputs()
+            again.open()
+            again.step('node', ['runtime'], lambda: self.fail('Node must not be rerun'))
+            again.step('amazonia', ['amazonia.next', 'amazonia.next.dependencies.json'],
+                       lambda: again.clone_build('amazonia.next', p.AMAZONIA))
+        self.assertEqual(sum(c[0:2] == ['git', 'clone'] for c in calls), 1)
+        self.assertEqual(sum(c[2:3] == ['install'] for c in calls), 2)
+        self.assertEqual((dest / 'partial-install').read_text(), 'preserve')
+        # A corrected prepare script OR changed helper invalidates this identity.
+        original_sha = p.sha
+        for script in ('oracle_prepare.py', 'oracle_provision.py'):
+            before = snapshot(prep.root)
+            def changed_sha(path):
+                return '0' * 64 if Path(path) == SCRIPTS / script else original_sha(path)
+            with patch.object(p, 'sha', side_effect=changed_sha):
+                changed = p.Preparation(self.c, self.backup, self.history, self.registry)
+            changed.initial = prep.initial
+            with self.assertRaisesRegex(p.Stop, '^WORKSPACE_INCOMPATIBLE$'):
+                changed.run()
+            self.assertEqual(snapshot(prep.root), before)
+        self.assertEqual(snapshot(self.backup), self.initial_backup)
+        self.assertEqual(snapshot(self.history), self.initial_history)
+
     def test_safe_report_no_raw_errors_or_registry_secrets(self):
         prep = self.opened()
         prep.phase = 'restoration'
