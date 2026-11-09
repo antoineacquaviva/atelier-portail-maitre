@@ -50,11 +50,14 @@ def main():
     parser.add_argument("--amazonia-root", required=True, type=Path)
     parser.add_argument("--tsx-loader", required=True, type=Path)
     parser.add_argument("--node", default=shutil.which("node"), type=Path)
+    parser.add_argument("--amazonia-commit", default=AMAZONIA_SHA,
+                        choices=(AMAZONIA_SHA, "e81bcf2076972b7617f6202d2bbfe94314144c17"),
+                        help="Immutable historical or 1C.3.4 preparation target")
     args = parser.parse_args()
     code, loader, node = (p.resolve(strict=True) for p in
                           (args.amazonia_root, args.tsx_loader, args.node))
     head = subprocess.check_output(["git", "-C", str(code), "rev-parse", "HEAD"], text=True).strip()
-    require(head == AMAZONIA_SHA, "Wrong Amazonia commit")
+    require(head == args.amazonia_commit, "Wrong Amazonia commit")
     require(not subprocess.check_output(["git", "-C", str(code), "status", "--porcelain"]),
             "Amazonia checkout must be unchanged")
     version = subprocess.check_output([str(node), "--version"], text=True).strip()
@@ -174,7 +177,7 @@ def main():
         sqlite_archive = stage / "sqlite-test-backup"
         sqlite_copy = stage / "sqlite-test-restored"
         manifest = json.loads((sqlite_archive / "backup-manifest.json").read_text())
-        require(manifest["software"]["softwareCommit"] == AMAZONIA_SHA, "Backup provenance")
+        require(manifest["software"]["softwareCommit"] == args.amazonia_commit, "Backup provenance")
         archive_before = snapshot(sqlite_archive)
         loaded_sqlite = snippet("load-restored").replace('"$STAGE" json', '"$STAGE" sqlite')
         loaded_sqlite = loaded_sqlite.replace("restored-campaigns.private.json", "sqlite-campaigns.private.json")

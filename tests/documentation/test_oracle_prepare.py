@@ -140,13 +140,13 @@ class Fixtures(unittest.TestCase):
         with self.assertRaisesRegex(p.Stop, 'STEP_OUTPUT_CHANGED'):
             again.step('first', ['first.txt'], lambda: None)
 
-    def test_amazonia_sync_requires_fresh_workspace_and_preserves_old_one(self):
+    def test_portal_sync_requires_fresh_workspace_and_preserves_old_one(self):
         self.assertEqual(p.AMAZONIA, 'e81bcf2076972b7617f6202d2bbfe94314144c17')
-        self.assertEqual(p.PORTAL, 'f62ef8148cdf18873272a169b48195443b532ce8')
-        # Reconstruct the previous script identity: only the Amazonia pin changed.
+        self.assertEqual(p.PORTAL, '9924ab535dace8c49bda208508d2384dcd56090d')
+        # Reconstruct the script before 1C.3.4: only the portal pin changed.
         source = (SCRIPTS / 'oracle_prepare.py').read_bytes()
-        old_source = source.replace(p.AMAZONIA.encode(),
-                                    b'efdb787ad3edad845dfc60c6124f6bca2cd4dd6e')
+        old_source = source.replace(p.PORTAL.encode(),
+                                    b'f62ef8148cdf18873272a169b48195443b532ce8')
         old_identity = hashlib.sha256(old_source).hexdigest() + p.sha(SCRIPTS / 'oracle_provision.py')
         self.assertNotEqual(old_identity, self.prep.state['implementation'])
         original_sha = p.sha
