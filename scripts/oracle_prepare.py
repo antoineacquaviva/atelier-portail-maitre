@@ -18,7 +18,7 @@ import sys
 import tarfile
 import urllib.request
 
-AMAZONIA = "efdb787ad3edad845dfc60c6124f6bca2cd4dd6e"
+AMAZONIA = "e81bcf2076972b7617f6202d2bbfe94314144c17"
 PORTAL = "f62ef8148cdf18873272a169b48195443b532ce8"
 BACKUP = Path('/home/opc/atelier-preparation-1c2-20261108-184942')
 HISTORY = Path('/home/opc/amazonia-data-backup-20261108-125739')
