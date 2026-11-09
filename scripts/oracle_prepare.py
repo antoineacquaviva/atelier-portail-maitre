@@ -19,7 +19,7 @@ import tarfile
 import urllib.request
 
 AMAZONIA = "e81bcf2076972b7617f6202d2bbfe94314144c17"
-PORTAL = "f62ef8148cdf18873272a169b48195443b532ce8"
+PORTAL = "9924ab535dace8c49bda208508d2384dcd56090d"
 BACKUP = Path('/home/opc/atelier-preparation-1c2-20261108-184942')
 HISTORY = Path('/home/opc/amazonia-data-backup-20261108-125739')
 REGISTRY = Path('/srv/jeu/tools-registry.json')

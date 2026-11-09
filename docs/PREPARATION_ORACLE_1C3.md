@@ -4,6 +4,8 @@
 
 Le complément 1C.3 du propriétaire précise que SELinux est Enforcing, Caddy est en 2.11.7, le registre réel contient quatre outils, et BGA est un projet futur vide, sans service. Ces informations remplacent pour cette préparation les inconnues correspondantes de 1C.2 : **conserver BGA, ne pas exiger sa santé, ne pas créer/démarrer son unité**. LoRA/Forêt/Amazonia/portail doivent rester actifs. Les ports 3000/5050 ouverts et les écoutes globales sont signalés comme travaux futurs B, jamais modifiés en P.
 
+**Reprise actuelle : suivre [la procédure groupée 1C.3.4](REPRISE_ORACLE_1C34.md).** Les sections datées 1C.3.2/1C.3.3 ci-dessous conservent les résultats historiques, pas les instructions de reprise actuelles.
+
 ## Trois opérations pour le propriétaire, après revue et accord P
 
 1. Transférer les trois scripts relus `oracle_prepare.py`, `oracle_provision.py` et `Get-OraclePreparation.ps1` dans un dossier personnel, **sans mettre à jour le checkout installé du portail**. Les deux fichiers Python restent côte à côte. Conserver leur version exacte durant une préparation/reprise. Python 3.9+, Git, tar, getenforce, systemctl et les binaires déjà installés sont requis ; aucun pip ni paquet système n'est installé par l'orchestrateur. Réserver une connexion de confiance vers GitHub, nodejs.org et npm. Les scripts npm des deux dépôts de confiance exécutent du code : ils font partie de l'accord P.
@@ -19,7 +21,7 @@ Le complément 1C.3 du propriétaire précise que SELinux est Enforcing, Caddy e
 }
 ```
 
-Le script refuse cette fiche tant que le checksum n'est pas remplacé. `npm_legacy_peer_deps` est facultatif et vaut false : les conflits npm arrêtent la préparation. Les recettes précédentes ont rencontré un conflit peer ; mettre true seulement après décision explicite sur cette résolution, dans une **nouvelle fiche/nouveau workspace** si une préparation a déjà commencé. Aucun `--force` ni repli de version automatique. Les lockfiles et dépendances réellement installées sont conservés dans les copies et l'export.
+Le script refuse cette fiche tant que le checksum n'est pas remplacé. `npm_legacy_peer_deps` est facultatif et vaut false : les conflits npm arrêtent la préparation. Pour la reprise 1C.3.4, conserver impérativement false ; ne pas contourner un conflit peer. Aucun `--force` ni repli de version automatique. Les lockfiles et dépendances réellement installées sont conservés dans les copies et l'export.
 
 3. Dans la session Oracle habituelle du propriétaire (aucune commande SSH à recopier depuis ce document), lancer la même entrée avec le mode voulu :
 
@@ -43,7 +45,7 @@ La deuxième commande est le point d'entrée principal. Elle affiche l'étape en
 | Capacité | Avant création, minimum de la fiche, estimation des archives développées, copies et marge ; réserve de 2 Gio avant étape écrivant et budget spécifique avant chaque export ; inodes contrôlés |
 | Emplacement privé | Nouveau workspace 0700 possédé par opc, état/config/code de l'orchestrateur liés par empreintes, verrou exclusif ; un dossier existant sans marqueur compatible est refusé |
 | Node parallèle | Archive officielle Linux x64, version exacte, double correspondance du pin approuvé et de SHASUMS256 officiel. Extraction uniquement dans une zone temporaire marquée ; vérification complète puis publication atomique sans remplacement. Une installation publiée existante est seulement lue et comparée : aucun fichier manquant n'est recréé. Exécution du nouveau Node et import SQLite en mémoire, jamais remplacement de `/usr/bin/node` ni PATH global |
-| Releases préparées | Amazonia `e81bcf2076972b7617f6202d2bbfe94314144c17` et portail `f62ef8148cdf18873272a169b48195443b532ce8` dans les seules copies privées ; npm install local, lint, tests et build avec les bases `/amazonia/` et `/` ; aucune auto-mise à jour du portail installé |
+| Releases préparées | Amazonia `e81bcf2076972b7617f6202d2bbfe94314144c17` et portail `9924ab535dace8c49bda208508d2384dcd56090d` dans les seules copies privées ; npm install local, lint, tests et build avec les bases `/amazonia/` et `/` ; aucune auto-mise à jour du portail installé |
 | Restauration isolée | Nouvelle génération `restore-N/data/campaigns`, conservation octet par octet des 16 JSON dont editions/seeds ; vrai gestionnaire, backup et restore SQLite dans la copie ; relecture des mêmes ID/états/compteurs. Aucune création/reprise de campagne, aucune suppression/réparation de JSON vide |
 | Registre / voisins | Empreinte du registre réel égale à sa sauvegarde, copie exacte, quatre routes conservées dont BGA ; validation applicative par prepare-caddy sur copie, aucune utilisation des DEFAULT_TOOLS |
 | Propositions | Fichiers `.proposed` sous candidates seulement, Basic avant branches, preuve interne prévue par variables Caddy, unités à Node absolu et comptes dédiés. Aucun install dans /etc/systemd, daemon-reload, validate/reload/restart Caddy ou appel admin |
